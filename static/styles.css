@@ -397,6 +397,26 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .banner.warn { background: var(--warn-soft); color: #7a4a08; border-color: rgba(217,131,23,.24); }
 .banner.warn svg { color: var(--warn); }
 
+/* ---------------------------------------------------------------- diagnostics */
+.checks { display: flex; flex-direction: column; }
+.check-row { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.check-row:last-child { border-bottom: 0; }
+.check-ic { width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; flex: 0 0 auto; }
+.check-ic svg { width: 15px; height: 15px; }
+.check-ic.good { background: var(--good-soft); color: var(--good); }
+.check-ic.bad { background: var(--bad-soft); color: var(--bad); }
+.check-ic.neutral { background: var(--surface-2); color: var(--muted); }
+.check-row .body { min-width: 0; }
+.check-row .t { font-size: 13px; font-weight: 600; }
+.check-row .s { font-size: 12px; color: var(--muted); }
+.check-row .err { margin-left: auto; font-size: 12px; color: var(--bad); max-width: 52%; text-align: right; }
+.check-row .pill { margin-left: auto; flex: 0 0 auto; }
+.diag-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.diag-table th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.diag-table td { padding: 9px 10px; border-bottom: 1px solid var(--border); }
+.diag-table tr:last-child td { border-bottom: 0; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; }
+
 .toast-wrap { position: fixed; bottom: 22px; right: 22px; z-index: 90; display: flex; flex-direction: column; gap: 10px; }
 .toast { background: var(--text); color: #fff; padding: 12px 15px; border-radius: 10px; box-shadow: var(--shadow-lg);
   font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 9px; animation: toastin .25s ease; max-width: 340px; }

@@ -47,6 +47,11 @@
         Recommendations
         <span class="count" id="nav-rec-count">—</span>
       </a>
+      <div class="group">System</div>
+      <a href="#diagnostics" data-view="diagnostics">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/><circle cx="12" cy="12" r="3.2"/></svg>
+        Connection
+      </a>
     </nav>
 
     <div class="sidebar-foot">
@@ -217,11 +222,19 @@
           <div id="rec-list"></div>
         </div>
       </section>
+      <!-- ------------------------------ DIAGNOSTICS ------------------------------ -->
+      <section class="view" id="view-diagnostics">
+        <div class="section-head">
+          <h2>Connection diagnostics</h2>
+          <span class="hint">Read-only checks of the cloud APIs this session is using</span>
+          <div style="margin-left:auto"><button class="btn subtle sm" id="btn-diag-refresh">Re-check</button></div>
+        </div>
+        <div id="diag-body"></div>
+      </section>
     </div>
   </div>
 </div>
 
-<!-- ============================== drawer ============================== -->
 <div class="drawer-scrim" id="scrim"></div>
 <aside class="drawer" id="drawer" aria-hidden="true">
   <div class="drawer-head">

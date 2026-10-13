@@ -1387,6 +1387,298 @@ def api_resources():
     )
 
 
+# =============================================================== diagnostics
+
+
+def _usd(amount: float) -> str:
+    return f"${amount:,.2f}"
+
+
+def _az_current_principal() -> str | None:
+    """Object ID of the currently signed-in Azure user (needs Graph access)."""
+    try:
+        user = _az_run(["ad", "signed-in-user", "show", "-o", "json"])
+    except Exception:  # noqa: BLE001
+        return None
+    return (user or {}).get("id")
+
+
+def _az_role_assignments(subscription_id: str) -> list[dict]:
+    url = (
+        f"https://management.azure.com/subscriptions/{subscription_id}"
+        "/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01"
+    )
+    return (_az_rest(url, method="get") or {}).get("value", []) or []
+
+
+def _az_role_name(subscription_id: str, role_definition_id: str) -> str:
+    rid = (role_definition_id or "").rsplit("/", 1)[-1]
+    if not rid:
+        return "Unknown"
+    url = (
+        f"https://management.azure.com/subscriptions/{subscription_id}"
+        f"/providers/Microsoft.Authorization/roleDefinitions/{rid}?api-version=2022-04-01"
+    )
+    try:
+        data = _az_rest(url, method="get") or {}
+        return (data.get("properties") or {}).get("roleName") or rid
+    except Exception:  # noqa: BLE001
+        return rid
+
+
+def _az_permission_actions(subscription_id: str) -> list[str]:
+    url = (
+        f"https://management.azure.com/subscriptions/{subscription_id}"
+        "/providers/Microsoft.Authorization/permissions?api-version=2022-04-01"
+    )
+    data = _az_rest(url, method="get") or {}
+    actions: list[str] = []
+    for entry in data.get("value", []) or []:
+        actions.extend(entry.get("actions", []) or [])
+    return sorted(set(actions))
+
+
+def _disk_is_unattached(disk: dict) -> bool:
+    props = disk.get("properties") or {}
+    raw = props.get("diskState") or disk.get("diskState")
+    if isinstance(raw, dict):
+        raw = raw.get("state")
+    return (raw or "").lower() == "unattached"
+
+
+def _azure_checks(subscription_id: str) -> list[dict]:
+    checks: list[dict] = [{"name": "Cost Management", "ok": False, "detail": "Query failed", "count": None, "error": None}]
+    try:
+        _daily, by_service, total = _fetch_costs_azure(subscription_id)
+        checks[0] = {
+            "name": "Cost Management", "ok": True,
+            "detail": f"{len(by_service)} service(s) · {_usd(total)} over {COST_DAYS}d",
+            "count": len(by_service), "error": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        checks[0]["error"] = _cloud_error(exc)
+
+    try:
+        vms = _az_run(["vm", "list", "-d", "--subscription", subscription_id, "-o", "json"]) or []
+        checks.append({"name": "Virtual machines", "ok": True, "detail": f"{len(vms)} VM(s)", "count": len(vms), "error": None})
+    except Exception as exc:  # noqa: BLE001
+        checks.append({"name": "Virtual machines", "ok": False, "detail": "List failed", "count": None, "error": _cloud_error(exc)})
+
+    disk_url = (
+        f"https://management.azure.com/subscriptions/{subscription_id}"
+        "/providers/Microsoft.Compute/disks?api-version=2023-04-02"
+    )
+    try:
+        disks = (_az_rest(disk_url, method="get") or {}).get("value", []) or []
+        unattached = [d for d in disks if _disk_is_unattached(d)]
+        checks.append({
+            "name": "Managed disks", "ok": True,
+            "detail": f"{len(disks)} disk(s) · {len(unattached)} unattached",
+            "count": len(disks), "error": None,
+        })
+    except Exception as exc:  # noqa: BLE001
+        checks.append({"name": "Managed disks", "ok": False, "detail": "List failed", "count": None, "error": _cloud_error(exc)})
+
+    try:
+        ips = _az_run(["network", "public-ip", "list", "--subscription", subscription_id, "-o", "json"]) or []
+        free = [i for i in ips if not i.get("ipConfiguration")]
+        checks.append({
+            "name": "Public IPs", "ok": True,
+            "detail": f"{len(ips)} IP(s) · {len(free)} unassociated",
+            "count": len(ips), "error": None,
+        })
+    except Exception as exc:  # noqa: BLE001
+        checks.append({"name": "Public IPs", "ok": False, "detail": "List failed", "count": None, "error": _cloud_error(exc)})
+
+    try:
+        assignments = _az_role_assignments(subscription_id)
+        checks.append({"name": "Role assignments", "ok": True, "detail": f"{len(assignments)} assignment(s)", "count": len(assignments), "error": None})
+    except Exception as exc:  # noqa: BLE001
+        checks.append({"name": "Role assignments", "ok": False, "detail": "Read failed", "count": None, "error": _cloud_error(exc)})
+
+    return checks
+
+
+def _diagnostics_azure(state: dict) -> dict:
+    sub = state.get("subscription") or {}
+    subscription_id = sub.get("id")
+    result: dict = {
+        "provider": "azure",
+        "scope": sub.get("name") or subscription_id,
+        "identity": state.get("identity") or {},
+        "subscription": sub,
+        "tenant": sub.get("tenantId"),
+        "current_principal": None,
+        "roles": [],
+        "roles_error": None,
+        "permissions": {"actions": [], "error": None},
+        "checks": [],
+        "required_access": [],
+        "hint": None,
+    }
+    if not subscription_id:
+        result["hint"] = "No Azure subscription is selected for this session."
+        return result
+
+    result["current_principal"] = _az_current_principal()
+
+    role_cache: dict[str, str] = {}
+    try:
+        assignments = _az_role_assignments(subscription_id)
+        roles = []
+        for a in assignments[:100]:
+            props = a.get("properties") or {}
+            definition = props.get("roleDefinitionId") or ""
+            if definition not in role_cache:
+                role_cache[definition] = _az_role_name(subscription_id, definition)
+            pid = props.get("principalId")
+            roles.append({
+                "role": role_cache[definition],
+                "principal_id": pid,
+                "principal_type": props.get("principalType") or "Unknown",
+                "is_you": bool(result["current_principal"] and pid and pid.lower() == result["current_principal"].lower()),
+                "scope": props.get("scope"),
+            })
+        roles.sort(key=lambda r: (not r["is_you"], r["role"]))
+        result["roles"] = roles
+    except Exception as exc:  # noqa: BLE001
+        result["roles_error"] = _cloud_error(exc)
+
+    try:
+        result["permissions"]["actions"] = _az_permission_actions(subscription_id)
+    except Exception as exc:  # noqa: BLE001
+        result["permissions"]["error"] = _cloud_error(exc)
+
+    result["checks"] = _azure_checks(subscription_id)
+
+    resource_checks = {c["name"] for c in result["checks"] if c["name"] in {"Virtual machines", "Managed disks", "Public IPs"}}
+    resources_ok = bool(resource_checks) and all(c["ok"] for c in result["checks"] if c["name"] in resource_checks)
+    cost_check = next((c for c in result["checks"] if c["name"] == "Cost Management"), None)
+    costs_ok = bool(cost_check and cost_check["ok"])
+
+    you = [r for r in result["roles"] if r.get("is_you")]
+    your_roles = {r["role"].strip().lower() for r in you}
+    read_roles = {"owner", "contributor", "reader"}
+    cost_roles = {"owner", "contributor", "cost management reader", "billing reader"}
+    if result["roles"]:
+        resources_present = any(r in your_roles for r in read_roles)
+        costs_present = any(r in your_roles for r in cost_roles)
+    else:
+        resources_present, costs_present = resources_ok, costs_ok
+
+    result["required_access"] = [
+        {"name": "Reader", "purpose": "List virtual machines, managed disks and public IPs.", "present": resources_present},
+        {"name": "Cost Management Reader", "purpose": "Run the Cost Management query for spend data.", "present": costs_present},
+    ]
+
+    if result["roles"] and not you:
+        result["hint"] = (
+            "Your signed-in identity does not appear in this subscription's role assignments. "
+            "Grant this account Reader + Cost Management Reader at the subscription, or sign in to the "
+            "tenant that owns the subscription."
+        )
+    elif result["roles_error"] and not result["roles"]:
+        result["hint"] = (
+            "Role assignments could not be read — this usually means your token belongs to a different "
+            "tenant than the subscription. Sign in with the subscription's home tenant."
+        )
+    elif not resources_present or not costs_present:
+        missing = [n for n, p in (("Reader", resources_present), ("Cost Management Reader", costs_present)) if not p]
+        result["hint"] = "Add the missing role(s) on this subscription: " + ", ".join(missing) + "."
+    elif not resources_ok and not costs_ok:
+        result["hint"] = "The APIs returned no data. Confirm the subscription has resources and that cost management is enabled."
+    return result
+
+
+def _diagnostics_aws(state: dict) -> dict:
+    profile = state.get("profile")
+    checks: list[dict] = []
+
+    try:
+        _daily, by_service, total = _fetch_costs_aws(profile)
+        checks.append({
+            "name": "Cost Explorer", "ok": True,
+            "detail": f"{len(by_service)} service(s) · {_usd(total)} over {COST_DAYS}d",
+            "count": len(by_service), "error": None,
+        })
+    except Exception as exc:  # noqa: BLE001
+        checks.append({"name": "Cost Explorer", "ok": False, "detail": "Query failed", "count": None, "error": _cloud_error(exc)})
+
+    try:
+        ec2 = _boto3_client("ec2", AWS_REGION, profile)
+        reservations = ec2.describe_instances().get("Reservations", [])
+        n = sum(len(r.get("Instances", [])) for r in reservations)
+        checks.append({"name": "EC2 instances", "ok": True, "detail": f"{n} instance(s)", "count": n, "error": None})
+    except Exception as exc:  # noqa: BLE001
+        checks.append({"name": "EC2 instances", "ok": False, "detail": "DescribeInstances failed", "count": None, "error": _cloud_error(exc)})
+
+    try:
+        volumes = _boto3_client("ec2", AWS_REGION, profile).describe_volumes().get("Volumes", [])
+        n = sum(1 for v in volumes if (v.get("State") or "").lower() == "available")
+        checks.append({"name": "EBS volumes", "ok": True, "detail": f"{len(volumes)} volume(s) · {n} unattached", "count": len(volumes), "error": None})
+    except Exception as exc:  # noqa: BLE001
+        checks.append({"name": "EBS volumes", "ok": False, "detail": "DescribeVolumes failed", "count": None, "error": _cloud_error(exc)})
+
+    try:
+        addresses = _boto3_client("ec2", AWS_REGION, profile).describe_addresses().get("Addresses", [])
+        n = sum(1 for a in addresses if not a.get("AssociationId"))
+        checks.append({"name": "Elastic IPs", "ok": True, "detail": f"{len(addresses)} IP(s) · {n} unassociated", "count": len(addresses), "error": None})
+    except Exception as exc:  # noqa: BLE001
+        checks.append({"name": "Elastic IPs", "ok": False, "detail": "DescribeAddresses failed", "count": None, "error": _cloud_error(exc)})
+
+    return {
+        "provider": "aws",
+        "scope": AWS_REGION,
+        "identity": state.get("identity") or {},
+        "tenant": None,
+        "subscription": None,
+        "current_principal": None,
+        "roles": [],
+        "roles_error": None,
+        "permissions": {"actions": [], "error": "IAM permissions cannot be enumerated from the caller's own credentials."},
+        "checks": checks,
+        "required_access": [
+            {"name": "sts:GetCallerIdentity", "purpose": "Confirm the signed-in account.", "present": None},
+            {"name": "ce:GetCostAndUsage", "purpose": "Read cost data (Cost Explorer must be enabled).", "present": None},
+            {"name": "ec2:DescribeInstances", "purpose": "List EC2 instances.", "present": None},
+            {"name": "ec2:DescribeVolumes", "purpose": "List EBS volumes.", "present": None},
+            {"name": "ec2:DescribeAddresses", "purpose": "List Elastic IPs.", "present": None},
+            {"name": "cloudwatch:GetMetricStatistics", "purpose": "Read instance CPU metrics.", "present": None},
+        ],
+        "hint": "The AWS managed policy ReadOnlyAccess covers every call above.",
+    }
+
+
+@app.get("/api/diagnostics")
+def api_diagnostics():
+    state = _current()
+    if not state:
+        return jsonify(error="not authenticated"), 401
+    try:
+        if state["provider"] == "azure":
+            data = _diagnostics_azure(state)
+        elif state["provider"] == "aws":
+            data = _diagnostics_aws(state)
+        else:
+            data = {
+                "provider": "demo",
+                "scope": "Demo sandbox",
+                "identity": state.get("identity") or {},
+                "tenant": None,
+                "subscription": None,
+                "current_principal": None,
+                "roles": [],
+                "roles_error": None,
+                "permissions": {"actions": [], "error": None},
+                "checks": [],
+                "required_access": [],
+                "hint": "Running in demo mode — no cloud API calls are made.",
+            }
+    except Exception as exc:  # noqa: BLE001
+        return jsonify(error=_cloud_error(exc)), 502
+    return jsonify(data)
+
+
 @app.get("/health")
 def health():
     return jsonify(
@@ -1420,6 +1712,11 @@ def _cloud_error(exc: Exception) -> str:
     text = re.sub(r"\n?\s*https?://aka\.ms/\S+\s*", " ", text)
     text = re.sub(r"\n?\s*Read more about the command in reference docs.*$", "", text, flags=re.S)
     text = re.sub(r"[ \t]+", " ", text).strip()
+    if "traceback (most recent call last)" in text.lower():
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        err = next((ln for ln in lines if ln.upper().startswith("ERROR:")), "")
+        head = text.split("Traceback", 1)[0].strip()
+        text = err or head or (lines[0] if lines else text)
     low = text.lower()
     if "following arguments are required" in low:
         missing = text.split("required:", 1)[-1].strip()

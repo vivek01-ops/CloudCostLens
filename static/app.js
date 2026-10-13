@@ -87,6 +87,7 @@ const S = {
   filter: { action: 'all', kind: 'all', q: '' },
   sort: { key: 'savings', dir: -1 },
   drawId: null,
+  diag: null,
 };
 
 /* ---------------------------------------------------------------- data load */
@@ -550,16 +551,141 @@ function exportCsv() {
   URL.revokeObjectURL(url); toast('Exported resources to CSV');
 }
 
+/* -------------------------------------------------------------- diagnostics */
+const DIAG_OK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+const DIAG_BAD = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+
+function providerLabel(p) {
+  return { aws: 'Amazon Web Services', azure: 'Microsoft Azure', demo: 'Demo sandbox' }[p] || p;
+}
+
+async function loadDiagnostics(force) {
+  const body = $('diag-body');
+  if (!body) return;
+  if (S.diag && !force) { renderDiagnostics(); return; }
+  body.innerHTML = '<div class="card"><div class="skeleton" style="height:140px"></div></div>';
+  try {
+    S.diag = await getJSON('/api/diagnostics');
+  } catch (err) {
+    if (err && err.message === 'unauthorized') return;
+    body.innerHTML = `<div class="card">${emptyState("Couldn't run diagnostics", err.message || 'Request failed')}</div>`;
+    return;
+  }
+  renderDiagnostics();
+}
+
+function diagRow(k, v) {
+  return `<div class="k">${esc(k)}</div><div class="v">${v}</div>`;
+}
+
+function checkRow(c) {
+  const ok = !!c.ok;
+  const right = c.error
+    ? `<div class="err">${esc(c.error)}</div>`
+    : `<span class="pill ${ok ? 'keep' : 'delete'}">${ok ? 'OK' : 'Failed'}</span>`;
+  return `<div class="check-row">
+      <span class="check-ic ${ok ? 'good' : 'bad'}">${ok ? DIAG_OK : DIAG_BAD}</span>
+      <div class="body"><div class="t">${esc(c.name)}</div><div class="s">${esc(c.detail || '')}</div></div>
+      ${right}
+    </div>`;
+}
+
+function requiredRow(r) {
+  const badge = r.present == null ? '' :
+    `<span class="pill ${r.present ? 'keep' : 'delete'}">${r.present ? 'Granted' : 'Missing'}</span>`;
+  const ic = r.present == null
+    ? '<span class="check-ic neutral"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg></span>'
+    : `<span class="check-ic ${r.present ? 'good' : 'bad'}">${r.present ? DIAG_OK : DIAG_BAD}</span>`;
+  return `<div class="check-row">
+      ${ic}
+      <div class="body"><div class="t">${esc(r.name)}</div><div class="s">${esc(r.purpose || '')}</div></div>
+      ${badge}
+    </div>`;
+}
+
+function rolesCard(d) {
+  let inner;
+  if (d.roles_error) {
+    inner = `<div class="callout bad"><p>${esc(d.roles_error)}</p></div>`;
+  } else if (!d.roles || !d.roles.length) {
+    inner = '<div class="callout warn"><p>No role assignments were returned at this scope — you may not have permission to read them.</p></div>';
+  } else {
+    inner = `<table class="diag-table">
+        <thead><tr><th>Role</th><th>Principal</th><th>Type</th>${d.current_principal ? '<th></th>' : ''}</tr></thead>
+        <tbody>${d.roles.map((r) => `<tr>
+          <td><b>${esc(r.role)}</b></td>
+          <td class="mono">${esc(r.principal_id || '—')}</td>
+          <td class="muted">${esc(r.principal_type || '—')}</td>
+          ${d.current_principal ? `<td>${r.is_you ? '<span class="pill keep">You</span>' : ''}</td>` : ''}
+        </tr>`).join('')}</tbody>
+      </table>`;
+  }
+  return `<div class="card"><div class="card-head"><h3>Role assignments at this scope</h3></div>${inner}</div>`;
+}
+
+function renderDiagnostics() {
+  const d = S.diag;
+  const body = $('diag-body');
+  if (!d || !body) return;
+  const id = d.identity || {};
+
+  const kv = [];
+  kv.push(diagRow('Provider', esc(providerLabel(d.provider))));
+  kv.push(diagRow('Scope', esc(d.scope || '—')));
+  if (d.provider === 'azure') {
+    kv.push(diagRow('Tenant', `<span class="mono">${esc(d.tenant || '—')}</span>`));
+    kv.push(diagRow('Subscription ID', `<span class="mono">${esc((d.subscription && d.subscription.id) || '—')}</span>`));
+    kv.push(diagRow('Signed-in user', esc(id.user || '—')));
+    kv.push(diagRow('Your object ID', `<span class="mono">${esc(d.current_principal || '—')}</span>`));
+  } else if (d.provider === 'aws') {
+    kv.push(diagRow('Account', `<span class="mono">${esc(id.account || '—')}</span>`));
+    kv.push(diagRow('User / Role', `<span class="mono">${esc(id.user || '—')}</span>`));
+    kv.push(diagRow('ARN', `<span class="mono">${esc(id.name || '—')}</span>`));
+  }
+
+  const checks = (d.checks || []).length
+    ? d.checks.map(checkRow).join('')
+    : '<div class="empty" style="padding:24px"><div class="t">No checks</div><div class="s">Nothing to verify in this mode.</div></div>';
+
+  const requiredTitle = d.provider === 'azure' ? 'Required roles (read-only)' : 'Required IAM permissions';
+  const required = (d.required_access || []).length
+    ? d.required_access.map(requiredRow).join('')
+    : '<div class="empty" style="padding:24px"><div class="t">—</div></div>';
+
+  const rolesBlock = d.provider === 'azure' ? rolesCard(d) : '';
+
+  body.innerHTML = `
+    <div class="grid g-2">
+      <div class="card">
+        <div class="card-head"><h3>Connection</h3><div class="sub">What this session is querying</div></div>
+        <div class="kv">${kv.join('')}</div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>API checks</h3><div class="sub">Live calls made by the dashboard</div></div>
+        <div class="checks">${checks}</div>
+      </div>
+    </div>
+    <div class="grid g-2" style="margin-top:16px">
+      ${rolesBlock}
+      <div class="card"${rolesBlock ? '' : ' style="grid-column:1/-1"'}>
+        <div class="card-head"><h3>${esc(requiredTitle)}</h3></div>
+        <div class="checks">${required}</div>
+      </div>
+    </div>
+    ${d.hint ? `<div class="callout warn" style="margin-top:16px"><h4>What to check</h4><p>${esc(d.hint)}</p></div>` : ''}`;
+}
+
 /* ------------------------------------------------------------------ routing */
 function activateView(v) {
-  if (!['overview', 'cost', 'resources', 'recommendations'].includes(v)) v = 'overview';
+  if (!['overview', 'cost', 'resources', 'recommendations', 'diagnostics'].includes(v)) v = 'overview';
   S.view = v;
   document.querySelectorAll('.view').forEach((el) => el.classList.toggle('active', el.id === 'view-' + v));
   document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.view === v));
-  $('view-title').textContent = { overview: 'Overview', cost: 'Cost Analysis', resources: 'Resources', recommendations: 'Recommendations' }[v];
+  $('view-title').textContent = { overview: 'Overview', cost: 'Cost Analysis', resources: 'Resources', recommendations: 'Recommendations', diagnostics: 'Connection diagnostics' }[v];
   $('sidebar').classList.remove('open');
   window.scrollTo({ top: 0, behavior: 'smooth' });
   ensureCharts(v);
+  if (v === 'diagnostics') loadDiagnostics(false);
 }
 
 /* -------------------------------------------------------------------- wire */
@@ -602,6 +728,7 @@ function wire() {
 
   $('btn-refresh').onclick = () => load(true);
   $('btn-export').onclick = exportCsv;
+  if ($('btn-diag-refresh')) $('btn-diag-refresh').onclick = () => loadDiagnostics(true);
   $('drawer-close').onclick = closeDrawer;
   $('scrim').onclick = closeDrawer;
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });

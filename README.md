@@ -123,6 +123,7 @@ is in-memory) with threads, and exposes a `/health` healthcheck.
 | `POST /api/auth/logout` | sign out |
 | `GET /api/costs` | daily spend + spend by service + total |
 | `GET /api/resources` | resources with usage + recommendation + savings |
+| `GET /api/diagnostics` | read-only connection checks: tenant/subscription, role assignments, effective permissions, per-source API status, required roles |
 | `GET /health` | health / demo flag / CLI availability |
 
 ## Notes
