@@ -89,6 +89,7 @@
       <div id="auth-url" class="auth-url-block" style="display:none">
         <p class="auth-hint" id="auth-url-label"></p>
         <div class="code" id="auth-code-display" style="display:none">…</div>
+        <button id="btn-copy-code" class="btn subtle" style="display:none">Copy code</button>
         <button id="btn-auth-open" class="btn">Open sign-in page</button>
         <p class="muted" style="margin-top:10px;word-break:break-all">Or copy this link: <a id="auth-link" href="#" target="_blank" rel="noopener"></a></p>
       </div>
@@ -287,26 +288,59 @@
         ? 'Open the sign-in page and enter this code:'
         : 'Open the sign-in page to get your authorization code, then paste it below:';
       const codeEl = $('auth-code-display');
-      if (code) { codeEl.textContent = code; codeEl.style.display = 'block'; }
-      else { codeEl.style.display = 'none'; }
+      if (code) {
+        codeEl.textContent = code;
+        codeEl.style.display = 'block';
+        $('btn-copy-code').style.display = 'inline-block';
+      } else if (!codeEl.textContent.trim() || codeEl.textContent.trim() === '…') {
+        codeEl.style.display = 'none';
+        $('btn-copy-code').style.display = 'none';
+      }
       const link = $('auth-link');
-      link.href = url;
-      link.textContent = url;
-      const open = () => window.open(url, '_blank', 'noopener');
+      if (url) { link.href = url; link.textContent = url; }
+      const open = () => window.open(url || link.href, '_blank', 'noopener');
       $('btn-auth-open').onclick = open;
       $('auth-url').style.display = 'block';
       if (authUrlShown) return;
       authUrlShown = true;
-      if (authTab && !authTab.closed && authTab.location) authTab.location.href = url;
-      else open();
+      if (url) {
+        if (authTab && !authTab.closed && authTab.location) authTab.location.href = url;
+        else window.open(url, '_blank', 'noopener');
+      }
+    }
+
+    $('btn-copy-code').onclick = async () => {
+      const code = $('auth-code-display').textContent.trim();
+      if (!code || code === '…') return;
+      const btn = $('btn-copy-code');
+      const restore = () => { btn.textContent = 'Copy code'; };
+      try {
+        await navigator.clipboard.writeText(code);
+        btn.textContent = 'Copied!';
+      } catch (e) {
+        const r = document.createRange();
+        r.selectNodeContents($('auth-code-display'));
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(r);
+        btn.textContent = 'Press Ctrl/Cmd+C';
+      }
+      setTimeout(restore, 1800);
     }
 
     function extractUrl(text) {
       let m = text.match(/Please visit the following URL:\s*(https?:\/\/\S+)/i);
       if (m) return m[1];
-      m = text.match(/https?:\/\/\S*(?:signin\.aws\.amazon\.com|devicelogin|microsoft\.com\/device)\S*/i)
+      m = text.match(/https?:\/\/\S*(?:signin\.aws\.amazon\.com|device\.sso|devicelogin|microsoft\.com\/device)\S*/i)
           || text.match(/https?:\/\/\S+/i);
       return m ? m[0] : null;
+    }
+
+    function extractCode(text) {
+      let m = text.match(/enter the code[:\s]*([A-Z0-9][A-Z0-9-]{2,})/i);
+      if (m) return m[1];
+      m = text.match(/\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/);
+      return m ? m[1] : null;
     }
 
     async function poll() {
@@ -321,10 +355,10 @@
                  || text.match(/(https?:\/\/\S*devicelogin\S*)[\s\S]*?code\s+([A-Za-z0-9]+)/i);
           if (m) showAuthUrl(m[1], m[2]);
         } else if (provider === 'aws') {
-          if (!customAuthUrl) {
-            const url = extractUrl((data.output || []).join('\n'));
-            if (url) showAuthUrl(url, null);
-          }
+          const text = (data.output || []).join('\n');
+          const code = extractCode(text);
+          const url = customAuthUrl ? null : extractUrl(text);
+          if (url || code) showAuthUrl(url, code);
         }
         if (data.status === 'ok') { alive = false; closeAuthTab(); window.location.href = '/'; return; }
         if (data.status === 'sso_account') {
