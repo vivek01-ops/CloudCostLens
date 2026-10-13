@@ -1,0 +1,118 @@
+# CloudCostLens local/VM stack.
+# Copy .env.example to .env and fill in values before running.
+name: cloudcostlens
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ccl}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ccl}
+      POSTGRES_DB: ${POSTGRES_DB:-cloudcostlens}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ccl} -d ${POSTGRES_DB:-cloudcostlens}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Postgres is intentionally NOT published to the host by default.
+    networks: [internal]
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: ["alembic", "upgrade", "head"]
+    env_file: [.env]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://ccl:ccl@db:5432/cloudcostlens}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    networks: [internal]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://ccl:ccl@db:5432/cloudcostlens}
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    networks: [internal]
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    command: ["python", "-m", "workers.cli", "discovery", "--loop", "--interval", "120"]
+    env_file: [.env]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://ccl:ccl@db:5432/cloudcostlens}
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [internal]
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    command: ["python", "-m", "workers.cli", "scheduler", "--loop", "--interval", "60"]
+    env_file: [.env]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://ccl:ccl@db:5432/cloudcostlens}
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [internal]
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "3000:3000"
+    networks: [internal]
+
+  # Reverse proxy for HTTPS in production. Terminate TLS here and route /api to the API.
+  proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - web
+      - api
+    networks: [internal]
+
+volumes:
+  pgdata:
+
+networks:
+  internal:
+    driver: bridge

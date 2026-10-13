@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cloudcostlens"
+version = "0.1.0"
+description = "AWS Cloud Cost Intelligence and Optimization Platform"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "CloudCostLens" }]
+dependencies = [
+    "fastapi==0.143.0",
+    "uvicorn[standard]==0.54.0",
+    "gunicorn==26.2.0",
+    "pydantic==2.14.1",
+    "pydantic-settings==2.15.0",
+    "email-validator==2.3.0",
+    "sqlalchemy==2.1.4",
+    "alembic==1.20.0",
+    "psycopg[binary]==3.3.6",
+    "boto3==1.43.111",
+    "botocore==1.43.111",
+    "argon2-cffi==25.1.0",
+    "bcrypt==5.0.0",
+    "cryptography==50.0.2",
+    "pyjwt==2.15.1",
+    "python-dateutil==2.9.0.post0",
+    "structlog==26.1.0",
+    "tenacity==9.2.1",
+    "cachetools==7.2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "ruff==0.17.0",
+    "httpx==0.28.1",
+]
+
+[project.scripts]
+ccl-bootstrap-owner = "scripts.bootstrap_owner:main"
+ccl-seed-demo = "scripts.seed_demo:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["core", "workers", "apps", "scripts"]
+# The web app is a Node project; it is not part of the Python distribution.
+exclude = ["apps/web"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["core", "apps/api", "workers", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"migrations/versions/*" = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "integration: tests that require a live PostgreSQL database",
+    "aws: tests that use Botocore Stubber",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
