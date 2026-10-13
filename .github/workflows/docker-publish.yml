@@ -16,8 +16,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-push:
+  # Job 1: build the multi-arch image and hand it off as an OCI archive. No registry access.
+  build:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,29 +31,68 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Compute image tags
+      - name: Compute image tag
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=sha,format=short,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push
+      - name: Build image (multi-arch, no push)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          push: true
           platforms: linux/amd64,linux/arm64
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=oci,dest=/tmp/image.tar
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Upload image archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  # Job 2: push the built image — commit-SHA tag, plus latest on the default branch.
+  push:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download image archive
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: /tmp/image
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Push commit tag
+        run: |
+          skopeo copy --all \
+            --dest-creds "${{ secrets.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_TOKEN }}" \
+            oci-archive:/tmp/image/image.tar \
+            docker://${{ env.IMAGE_NAME }}:${{ needs.build.outputs.tag }}
+
+      - name: Push latest (default branch only)
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        run: |
+          skopeo copy --all \
+            --src-creds "${{ secrets.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_TOKEN }}" \
+            --dest-creds "${{ secrets.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_TOKEN }}" \
+            docker://${{ env.IMAGE_NAME }}:${{ needs.build.outputs.tag }} \
+            docker://${{ env.IMAGE_NAME }}:latest
