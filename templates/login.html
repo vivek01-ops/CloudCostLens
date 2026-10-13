@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in · CloudCostLens</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f5bff'/%3E%3Cpath d='M9 20l4-6 3 4 3-5 4 7' stroke='white' stroke-width='2.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+</head>
+<body class="auth-body">
+  <div class="auth-card">
+    <div class="auth-brand">
+      <div class="mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 17l5-5 4 3 6-7"/><path d="M3 21h18"/>
+        </svg>
+      </div>
+      <div>
+        <h1>CloudCostLens</h1>
+        <div class="sub">Cloud Cost Management</div>
+      </div>
+    </div>
+
+    <p class="lead">Connect a cloud account to analyze spend, usage and right-sizing opportunities. Read-only — nothing is ever changed.</p>
+
+    <div class="tabs">
+      <button id="tab-aws" data-provider="aws">AWS</button>
+      <button id="tab-azure" data-provider="azure">Azure</button>
+    </div>
+
+    <div id="step-start" class="step active">
+      <p class="auth-hint" id="provider-hint"></p>
+      <div id="opt-remote" class="check" style="display:none">
+        <input type="checkbox" id="remote" /><label for="remote" style="margin:0">Headless (print a URL, paste a code)</label>
+      </div>
+      <div id="opt-sso" class="check" style="display:none">
+        <input type="checkbox" id="sso" /><label for="sso" style="margin:0">Use AWS IAM Identity Center (SSO)</label>
+      </div>
+      <div id="opt-sso-fields" class="field" style="display:none">
+        <label for="sso-start-url">SSO start URL</label>
+        <input id="sso-start-url" placeholder="https://my-sso-portal.awsapps.com/start" autocomplete="off" />
+      </div>
+      <div id="opt-sso-region" class="field" style="display:none">
+        <label for="sso-region">SSO region (optional)</label>
+        <input id="sso-region" placeholder="us-east-1" autocomplete="off" />
+      </div>
+      <div id="opt-sso-account" class="field" style="display:none">
+        <label for="sso-account">Account ID (optional — choose after login)</label>
+        <input id="sso-account" placeholder="111122223333" autocomplete="off" />
+      </div>
+      <div id="opt-sso-role" class="field" style="display:none">
+        <label for="sso-role">Role name (optional — required if account is set)</label>
+        <input id="sso-role" placeholder="AdministratorAccess" autocomplete="off" />
+      </div>
+      <div id="opt-signin" class="field" style="display:none">
+        <label for="aws-signin-url">Custom sign-in URL (optional)</label>
+        <input id="aws-signin-url" placeholder="Paste a sign-in URL to open instead" autocomplete="off" />
+      </div>
+      <div id="opt-device" class="check" style="display:none">
+        <input type="checkbox" id="device_code" /><label for="device_code" style="margin:0">Use device code</label>
+      </div>
+      <div id="opt-tenant" class="field" style="display:none">
+        <label for="tenant">Tenant ID or domain (optional)</label>
+        <input id="tenant" placeholder="contoso.onmicrosoft.com" autocomplete="off" />
+      </div>
+      <button id="btn-login" class="btn">Sign in</button>
+      <button id="btn-check" class="btn ghost">I already have cloud credentials</button>
+      {% if demo %}
+      <button id="btn-demo" class="btn ghost">Continue in demo mode</button>
+      {% endif %}
+      <div id="error-start" class="error"></div>
+      <p class="error" id="missing-note" style="display:none"></p>
+      <button id="btn-install" class="btn subtle" style="display:none">Install the CLI now</button>
+    </div>
+
+    <div id="step-install" class="step">
+      <p class="auth-hint"><span class="spinner"></span>Installing the CLI (no sudo needed)…</p>
+      <div id="install-log" class="log" style="display:none"></div>
+      <div id="error-install" class="error"></div>
+      <button id="btn-install-continue" class="btn" style="display:none">Continue</button>
+      <button id="btn-install-retry" class="btn ghost" style="display:none">Retry install</button>
+    </div>
+
+    <div id="step-wait" class="step">
+      <p class="auth-hint"><span class="spinner"></span>Waiting for the CLI login to finish…</p>
+      <p class="auth-hint" id="wait-hint"></p>
+      <div id="login-log" class="log" style="display:none"></div>
+      <div id="auth-url" class="auth-url-block" style="display:none">
+        <p class="auth-hint" id="auth-url-label"></p>
+        <div class="code" id="auth-code-display" style="display:none">…</div>
+        <button id="btn-auth-open" class="btn">Open sign-in page</button>
+        <p class="muted" style="margin-top:10px;word-break:break-all">Or copy this link: <a id="auth-link" href="#" target="_blank" rel="noopener"></a></p>
+      </div>
+      <div id="remote-wrap" style="display:none">
+        <div class="field">
+          <label for="auth-code">Authorization code</label>
+          <input id="auth-code" placeholder="Paste the code shown in your browser" autocomplete="off" />
+        </div>
+        <button id="btn-code" class="btn">Submit code</button>
+      </div>
+      <div id="error-wait" class="error"></div>
+      <button id="btn-retry" class="btn ghost" style="display:none">Start over</button>
+    </div>
+
+    <div id="step-subscription" class="step">
+      <p class="auth-hint">Choose the Azure subscription to analyze:</p>
+      <div class="field">
+        <label for="subscription">Subscription</label>
+        <select id="subscription"></select>
+      </div>
+      <button id="btn-subscription" class="btn">Continue</button>
+      <div id="error-subscription" class="error"></div>
+    </div>
+
+    <div id="step-sso-account" class="step">
+      <p class="auth-hint">Signed in. Choose the AWS account to analyze:</p>
+      <div class="field">
+        <label for="sso-account-select">Account</label>
+        <select id="sso-account-select"></select>
+      </div>
+      <button id="btn-sso-account" class="btn">Continue</button>
+      <div id="error-sso-account" class="error"></div>
+    </div>
+
+    <div id="step-sso-role" class="step">
+      <p class="auth-hint">Choose the role to assume in this account:</p>
+      <div class="field">
+        <label for="sso-role-select">Role</label>
+        <select id="sso-role-select"></select>
+      </div>
+      <button id="btn-sso-role" class="btn">Continue</button>
+      <div id="error-sso-role" class="error"></div>
+    </div>
+
+    <div id="step-nosub" class="step">
+      <p class="auth-hint" id="nosub-msg"></p>
+      <div class="field">
+        <label for="manual-sub">Azure subscription ID (optional)</label>
+        <input id="manual-sub" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off" />
+      </div>
+      <button id="btn-manual-sub" class="btn">Use this subscription</button>
+      <button id="btn-nosub-retry" class="btn ghost">Sign in again</button>
+      <div id="error-nosub" class="error"></div>
+    </div>
+
+    <div class="auth-foot">CloudCostLens is read-only and only recommends changes.</div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const show = (id) => document.querySelectorAll('.step').forEach(s => s.classList.toggle('active', s.id === id));
+
+    const AVAILABLE = { aws: {{ 'true' if aws_available else 'false' }}, azure: {{ 'true' if azure_available else 'false' }} };
+    const HINTS = {
+      aws: 'This runs `aws login` on the machine hosting the app. Your browser opens, you sign in with your normal AWS account, and temporary credentials are cached locally.',
+      azure: 'This runs `az login` on the machine hosting the app. Your browser opens, you sign in with your normal Azure account, and credentials are cached locally in ~/.azure.'
+    };
+    const SSO_HINT = 'Signs in through AWS IAM Identity Center (SSO). We write a local sso-session and run `aws sso login`, then you pick an account and role.';
+    const MISSING = {
+      aws: 'The AWS CLI (aws) was not found on this machine.',
+      azure: 'The Azure CLI (az) was not found on this machine.'
+    };
+    let provider = 'aws';
+    let alive = false, pollTimer = null, installAlive = false, installTimer = null;
+    let authTab = null, authUrlShown = false, customAuthUrl = false;
+
+    function syncAwsOpts() {
+      const isAws = provider === 'aws';
+      const sso = isAws && $('sso').checked;
+      $('opt-sso').style.display = isAws ? 'flex' : 'none';
+      $('opt-sso-fields').style.display = sso ? 'block' : 'none';
+      $('opt-sso-region').style.display = sso ? 'block' : 'none';
+      $('opt-sso-account').style.display = sso ? 'block' : 'none';
+      $('opt-sso-role').style.display = sso ? 'block' : 'none';
+      $('opt-remote').style.display = isAws && !sso ? 'flex' : 'none';
+      $('opt-signin').style.display = isAws && !sso ? 'block' : 'none';
+      $('provider-hint').textContent = sso ? SSO_HINT : HINTS[provider];
+    }
+
+    function setProvider(p) {
+      provider = p;
+      document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.provider === p));
+      $('opt-device').style.display = p === 'azure' ? 'flex' : 'none';
+      $('opt-tenant').style.display = p === 'azure' ? 'block' : 'none';
+      if (p === 'azure') $('device_code').checked = true;
+      $('missing-note').style.display = AVAILABLE[p] ? 'none' : 'block';
+      $('missing-note').textContent = MISSING[p];
+      $('btn-install').style.display = AVAILABLE[p] ? 'none' : 'block';
+      $('btn-login').disabled = !AVAILABLE[p];
+      $('error-start').textContent = '';
+      syncAwsOpts();
+    }
+    document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => { if (alive) return; setProvider(b.dataset.provider); show('step-start'); });
+    $('sso').onchange = syncAwsOpts;
+
+    function setLog(el, lines) {
+      if (!lines || !lines.length) { el.style.display = 'none'; return; }
+      el.style.display = 'block';
+      el.textContent = lines.join('\n');
+      el.scrollTop = el.scrollHeight;
+    }
+
+    $('btn-check').onclick = async () => {
+      $('error-start').textContent = '';
+      $('btn-check').disabled = true;
+      try {
+        const res = await fetch('/api/auth/check', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'No cloud credentials found.');
+        window.location.href = '/';
+      } catch (err) {
+        $('error-start').textContent = err.message;
+        $('btn-check').disabled = false;
+      }
+    };
+
+    $('btn-login').onclick = async () => {
+      $('error-start').textContent = '';
+      $('btn-login').disabled = true;
+      authUrlShown = false;
+      customAuthUrl = false;
+      $('auth-url').style.display = 'none';
+      const isSso = provider === 'aws' && $('sso').checked;
+      const customUrl = (provider === 'aws' && !isSso) ? $('aws-signin-url').value.trim() : '';
+      if (isSso && !$('sso-start-url').value.trim()) {
+        $('error-start').textContent = 'Enter the SSO start URL.';
+        $('btn-login').disabled = false;
+        return;
+      }
+      const wantsTab = provider === 'azure' || (provider === 'aws' && (isSso || $('remote').checked || !!customUrl));
+      // Open a placeholder tab during the click gesture so the sign-in page can be
+      // loaded into it once the CLI prints its URL (popup blockers allow this).
+      authTab = wantsTab ? window.open('', '_blank') : null;
+      try {
+        const body = { provider };
+        if (provider === 'aws') {
+          body.sso = isSso;
+          if (isSso) {
+            body.remote = true;
+            body.start_url = $('sso-start-url').value.trim();
+            body.region = $('sso-region').value.trim();
+            body.account = $('sso-account').value.trim();
+            body.role = $('sso-role').value.trim();
+          } else {
+            body.remote = $('remote').checked || !!customUrl;
+            body.signin_url = customUrl;
+          }
+        }
+        if (provider === 'azure') body.device_code = $('device_code').checked;
+        if (provider === 'azure') body.tenant = $('tenant').value.trim();
+        const res = await fetch('/api/auth/login', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to start login.');
+        $('remote-wrap').style.display = provider === 'aws' && body.remote && !isSso ? 'block' : 'none';
+        $('wait-hint').textContent = provider === 'azure'
+          ? 'A sign-in tab should open. If it does not, use the button below and enter the code shown.'
+          : (isSso
+            ? 'Approve the sign-in with the code shown, then choose your account and role.'
+            : (body.remote
+              ? 'A sign-in tab should open. If it does not, use the button below, then paste the code it shows.'
+              : 'A browser window should open for you to sign in.'));
+        $('btn-retry').style.display = 'none';
+        show('step-wait');
+        if (customUrl) { customAuthUrl = true; showAuthUrl(customUrl, null); }
+        alive = true;
+        poll();
+      } catch (err) {
+        if (authTab && !authTab.closed) authTab.close();
+        $('error-start').textContent = err.message;
+        $('btn-login').disabled = false;
+      }
+    };
+
+    function closeAuthTab() {
+      if (authTab && !authTab.closed) { try { authTab.close(); } catch (e) {} }
+      authTab = null;
+    }
+
+    function showAuthUrl(url, code) {
+      $('auth-url-label').textContent = code
+        ? 'Open the sign-in page and enter this code:'
+        : 'Open the sign-in page to get your authorization code, then paste it below:';
+      const codeEl = $('auth-code-display');
+      if (code) { codeEl.textContent = code; codeEl.style.display = 'block'; }
+      else { codeEl.style.display = 'none'; }
+      const link = $('auth-link');
+      link.href = url;
+      link.textContent = url;
+      const open = () => window.open(url, '_blank', 'noopener');
+      $('btn-auth-open').onclick = open;
+      $('auth-url').style.display = 'block';
+      if (authUrlShown) return;
+      authUrlShown = true;
+      if (authTab && !authTab.closed && authTab.location) authTab.location.href = url;
+      else open();
+    }
+
+    function extractUrl(text) {
+      let m = text.match(/Please visit the following URL:\s*(https?:\/\/\S+)/i);
+      if (m) return m[1];
+      m = text.match(/https?:\/\/\S*(?:signin\.aws\.amazon\.com|devicelogin|microsoft\.com\/device)\S*/i)
+          || text.match(/https?:\/\/\S+/i);
+      return m ? m[0] : null;
+    }
+
+    async function poll() {
+      if (!alive) return;
+      try {
+        const res = await fetch('/api/auth/status');
+        const data = await res.json();
+        setLog($('login-log'), data.output);
+        if (provider === 'azure') {
+          const text = (data.output || []).join('\n');
+          const m = text.match(/open the page\s+(https?:\/\/\S+?)\s+and enter the code\s+([A-Za-z0-9]+)/i)
+                 || text.match(/(https?:\/\/\S*devicelogin\S*)[\s\S]*?code\s+([A-Za-z0-9]+)/i);
+          if (m) showAuthUrl(m[1], m[2]);
+        } else if (provider === 'aws') {
+          if (!customAuthUrl) {
+            const url = extractUrl((data.output || []).join('\n'));
+            if (url) showAuthUrl(url, null);
+          }
+        }
+        if (data.status === 'ok') { alive = false; closeAuthTab(); window.location.href = '/'; return; }
+        if (data.status === 'sso_account') {
+          alive = false;
+          closeAuthTab();
+          const sel = $('sso-account-select');
+          sel.innerHTML = (data.accounts || []).map(a =>
+            `<option value="${a.id}">${a.name} · ${a.id}</option>`).join('');
+          $('error-sso-account').textContent = '';
+          show('step-sso-account');
+          return;
+        }
+        if (data.status === 'subscription') {
+          alive = false;
+          closeAuthTab();
+          const sel = $('subscription');
+          sel.innerHTML = data.subscriptions.map(s =>
+            `<option value="${s.id}">${s.name}${s.tenantName ? ' · ' + s.tenantName : ''}</option>`).join('');
+          show('step-subscription');
+          return;
+        }
+        if (data.status === 'no_subscription') {
+          alive = false;
+          closeAuthTab();
+          $('nosub-msg').textContent = data.message || 'No Azure subscriptions found.';
+          $('error-nosub').textContent = '';
+          $('manual-sub').value = '';
+          show('step-nosub');
+          return;
+        }
+        if (data.status === 'error') {
+          alive = false;
+          closeAuthTab();
+          $('error-wait').textContent = data.error || 'Login failed.';
+          $('btn-retry').style.display = 'block';
+          return;
+        }
+        pollTimer = setTimeout(poll, 1500);
+      } catch (err) {
+        $('error-wait').textContent = err.message;
+        pollTimer = setTimeout(poll, 3000);
+      }
+    }
+
+    $('btn-code').onclick = async () => {
+      $('error-wait').textContent = '';
+      try {
+        const res = await fetch('/api/auth/code', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: $('auth-code').value })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to submit code.');
+        $('auth-code').value = '';
+      } catch (err) { $('error-wait').textContent = err.message; }
+    };
+
+    $('btn-subscription').onclick = async () => {
+      $('error-subscription').textContent = '';
+      $('btn-subscription').disabled = true;
+      try {
+        const res = await fetch('/api/auth/subscription', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: $('subscription').value })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not select subscription.');
+        window.location.href = '/';
+      } catch (err) {
+        $('error-subscription').textContent = err.message;
+        $('btn-subscription').disabled = false;
+      }
+    };
+
+    $('btn-retry').onclick = () => { alive = false; if (pollTimer) clearTimeout(pollTimer); closeAuthTab(); authUrlShown = false; $('auth-url').style.display = 'none'; $('error-wait').textContent = ''; show('step-start'); setProvider(provider); };
+
+    $('btn-manual-sub').onclick = async () => {
+      $('error-nosub').textContent = '';
+      const id = $('manual-sub').value.trim();
+      if (!id) { $('error-nosub').textContent = 'Enter a subscription ID.'; return; }
+      $('btn-manual-sub').disabled = true;
+      try {
+        const res = await fetch('/api/auth/subscription', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not use that subscription.');
+        window.location.href = '/';
+      } catch (err) {
+        $('error-nosub').textContent = err.message;
+        $('btn-manual-sub').disabled = false;
+      }
+    };
+
+    $('btn-nosub-retry').onclick = () => { $('error-nosub').textContent = ''; show('step-start'); setProvider('azure'); };
+
+    $('btn-sso-account').onclick = async () => {
+      $('error-sso-account').textContent = '';
+      $('btn-sso-account').disabled = true;
+      try {
+        const res = await fetch('/api/auth/sso/roles', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ account: $('sso-account-select').value })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not list roles.');
+        if (!data.roles || !data.roles.length) throw new Error('No roles are available for this account.');
+        $('sso-role-select').innerHTML = data.roles.map(r => `<option value="${r.name}">${r.name}</option>`).join('');
+        $('error-sso-role').textContent = '';
+        show('step-sso-role');
+      } catch (err) {
+        $('error-sso-account').textContent = err.message;
+      }
+      $('btn-sso-account').disabled = false;
+    };
+
+    $('btn-sso-role').onclick = async () => {
+      $('error-sso-role').textContent = '';
+      $('btn-sso-role').disabled = true;
+      try {
+        const res = await fetch('/api/auth/sso/select', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ account: $('sso-account-select').value, role: $('sso-role-select').value })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not finish SSO login.');
+        window.location.href = '/';
+      } catch (err) {
+        $('error-sso-role').textContent = err.message;
+        $('btn-sso-role').disabled = false;
+      }
+    };
+
+    const demoBtn = $('btn-demo');
+    if (demoBtn) demoBtn.onclick = async () => { await fetch('/api/auth/demo', { method: 'POST' }); window.location.href = '/'; };
+
+    $('btn-install').onclick = async () => {
+      $('error-install').textContent = '';
+      $('btn-install-continue').style.display = 'none';
+      $('btn-install-retry').style.display = 'none';
+      try {
+        const res = await fetch('/api/auth/install', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to start install.');
+        if (data.status === 'ok') { window.location.reload(); return; }
+        show('step-install');
+        installAlive = true;
+        pollInstall();
+      } catch (err) { $('error-start').textContent = err.message; }
+    };
+
+    async function pollInstall() {
+      if (!installAlive) return;
+      try {
+        const res = await fetch('/api/auth/install-status');
+        const data = await res.json();
+        setLog($('install-log'), data.output);
+        if (data.status === 'ok') { installAlive = false; $('btn-install-continue').style.display = 'block'; return; }
+        if (data.status === 'error') { installAlive = false; $('error-install').textContent = 'Install failed. See the log above.'; $('btn-install-retry').style.display = 'block'; return; }
+        installTimer = setTimeout(pollInstall, 1500);
+      } catch (err) { $('error-install').textContent = err.message; installTimer = setTimeout(pollInstall, 3000); }
+    }
+
+    $('btn-install-continue').onclick = () => window.location.reload();
+    $('btn-install-retry').onclick = () => { installAlive = false; if (installTimer) clearTimeout(installTimer); $('btn-install').click(); };
+
+    setProvider('aws');
+  </script>
+</body>
+</html>

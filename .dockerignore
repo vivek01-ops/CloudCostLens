@@ -1,19 +1,18 @@
+# Version control / local dev artifacts (never needed in the image)
 .git
+.gitignore
 .venv
-venv
 __pycache__
 *.pyc
 .pytest_cache
-.ruff_cache
-.mypy_cache
-node_modules
-apps/web/.next
-apps/web/node_modules
-.next
-out
+
+# Secrets and local config (passed at runtime instead)
 .env
-.env.*
-!.env.example
-*.sqlite3
-backups
-docs
+
+# Docker meta (not part of the app)
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Docs
+*.md

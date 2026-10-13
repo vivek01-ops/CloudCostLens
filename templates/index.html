@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CloudCostLens · Cloud Cost Management</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f5bff'/%3E%3Cpath d='M9 20l4-6 3 4 3-5 4 7' stroke='white' stroke-width='2.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<div class="app">
+
+  <!-- ============================== sidebar ============================== -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 17l5-5 4 3 6-7"/><path d="M3 21h18"/>
+        </svg>
+      </div>
+      <div>
+        <div class="name">CloudCostLens</div>
+        <div class="sub">Cost Intelligence</div>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <div class="group">Analyze</div>
+      <a href="#overview" data-view="overview" class="active">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
+        Overview
+      </a>
+      <a href="#cost" data-view="cost">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/></svg>
+        Cost Analysis
+      </a>
+      <a href="#resources" data-view="resources">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
+        Resources
+        <span class="count" id="nav-res-count">—</span>
+      </a>
+      <div class="group">Optimize</div>
+      <a href="#recommendations" data-view="recommendations">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.6.6 1 1.5 1 2.5h6c0-1 .4-1.9 1-2.5A6 6 0 0 0 12 3z"/></svg>
+        Recommendations
+        <span class="count" id="nav-rec-count">—</span>
+      </a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="env-chip">
+        <span class="dot {% if provider == 'demo' %}demo{% endif %}" id="env-dot"></span>
+        <div>
+          <div class="t" id="env-title">
+            {% if provider == 'aws' %}Live · AWS{% elif provider == 'azure' %}Live · Azure{% else %}Demo sandbox{% endif %}
+          </div>
+          <div class="s" id="env-sub">{{ account or 'Not connected' }}</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ============================== main ============================== -->
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn hamburger" id="hamburger" aria-label="Menu">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+      <div class="titles">
+        <div class="crumb">Cloud cost management</div>
+        <h1 id="view-title">Overview</h1>
+      </div>
+      <div class="spacer"></div>
+
+      <div class="scope">
+        <span class="k">Scope</span>
+        <b id="scope-name">{{ account or 'Demo' }}</b>
+      </div>
+      {% if region %}
+      <div class="scope"><span class="k">Region</span><b>{{ region }}</b></div>
+      {% elif detail %}
+      <div class="scope"><span class="k">Subscription</span><b>{{ detail }}</b></div>
+      {% endif %}
+
+      <div class="seg" id="range-seg">
+        <button data-days="7">7D</button>
+        <button data-days="14">14D</button>
+        <button data-days="30" class="active">30D</button>
+      </div>
+
+      <button class="icon-btn" id="btn-refresh" title="Refresh data" aria-label="Refresh">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 4v5h-5"/></svg>
+      </button>
+      <button class="btn ghost sm" id="btn-export">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
+        Export
+      </button>
+      <button class="icon-btn" id="btn-signout" title="Sign out" aria-label="Sign out">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
+      </button>
+    </header>
+
+    <div class="content">
+      <div id="error-banner"></div>
+
+      <!-- ------------------------------ OVERVIEW ------------------------------ -->
+      <section class="view active" id="view-overview">
+        <div class="grid g-kpi" id="kpis"></div>
+
+        <div class="grid g-2" style="margin-top:16px">
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h3>Daily spend trend</h3>
+                <div class="sub" id="trend-sub">Cost per day across the selected window</div>
+              </div>
+              <div class="right">
+                <span class="delta flat" id="trend-delta">—</span>
+              </div>
+            </div>
+            <div class="chart-box"><canvas id="chart-daily"></canvas></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>Cost by service</h3></div>
+            <div class="donut-wrap">
+              <div class="donut-canvas">
+                <canvas id="chart-service"></canvas>
+                <div class="donut-center">
+                  <div class="b" id="donut-total">—</div>
+                  <div class="s">Total</div>
+                </div>
+              </div>
+              <div class="legend" id="service-legend"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-head">
+          <h2>Optimization opportunities</h2>
+          <span class="hint">Highest-impact savings actions, ranked</span>
+          <div style="margin-left:auto"><button class="btn subtle sm" data-goto="recommendations">View all</button></div>
+        </div>
+        <div class="grid g-2e">
+          <div class="card" style="padding-top:8px">
+            <div id="opp-list"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Savings by action</h3><div class="sub">Monthly, if remediated</div></div>
+            <div id="action-bars"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ------------------------------ COST ------------------------------ -->
+      <section class="view" id="view-cost">
+        <div class="stats" id="cost-stats"></div>
+        <div class="card" style="margin-top:16px">
+          <div class="card-head">
+            <div><h3>Daily cost</h3><div class="sub">Hover any point for the exact day</div></div>
+          </div>
+          <div class="chart-box"><canvas id="chart-daily-2"></canvas></div>
+        </div>
+        <div class="grid g-2" style="margin-top:16px">
+          <div class="card">
+            <div class="card-head"><h3>Spend by service</h3><div class="sub" id="svc-sub"></div></div>
+            <div id="service-bars"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Cost drivers</h3></div>
+            <div id="cost-drivers"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ------------------------------ RESOURCES ------------------------------ -->
+      <section class="view" id="view-resources">
+        <div class="toolbar">
+          <div class="search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+            <input id="res-search" placeholder="Search by name, type or state…" autocomplete="off" />
+          </div>
+          <select class="select" id="res-kind"><option value="all">All types</option></select>
+          <select class="select" id="res-sort">
+            <option value="savings">Sort: Savings</option>
+            <option value="cost">Sort: Monthly cost</option>
+            <option value="cpu">Sort: CPU usage</option>
+            <option value="name">Sort: Name</option>
+          </select>
+        </div>
+        <div class="chips" id="res-chips" style="margin-bottom:14px"></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th data-key="name">Resource <span class="arw">▼</span></th>
+                <th data-key="kind">Type <span class="arw">▼</span></th>
+                <th data-key="state" class="no-sort">State</th>
+                <th data-key="cpu" class="num">CPU <span class="arw">▼</span></th>
+                <th data-key="cost" class="num">Monthly <span class="arw">▼</span></th>
+                <th data-key="action" class="no-sort">Recommendation</th>
+                <th data-key="savings" class="num sorted">Save / mo <span class="arw">▼</span></th>
+              </tr>
+            </thead>
+            <tbody id="res-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ------------------------------ RECOMMENDATIONS ------------------------------ -->
+      <section class="view" id="view-recommendations">
+        <div class="grid g-4" id="rec-cards"></div>
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h3>All recommendations</h3><div class="sub">Read-only — nothing is changed for you</div></div>
+          <div id="rec-list"></div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<!-- ============================== drawer ============================== -->
+<div class="drawer-scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <div>
+      <div class="t" id="drawer-title">Resource</div>
+      <div class="s" id="drawer-sub"></div>
+    </div>
+    <button class="x" id="drawer-close" aria-label="Close">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<script>
+  window.__CCL__ = {
+    provider: '{{ provider }}',
+    account: {{ (account or '')|tojson }},
+    detail: {{ (detail or '')|tojson }},
+    region: {{ (region or '')|tojson }},
+    days: {{ days }}
+  };
+</script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
