@@ -1,0 +1,529 @@
+openapi: 3.0.3
+info:
+  title: CloudCostLens API
+  description: |
+    Cloud cost and usage dashboard API. Read-only by design (never modifies cloud resources).
+    Supports AWS (live + CLI SSO), Azure (az CLI/ARM/Cost Management), and Demo mode.
+    Security: CSRF on mutating endpoints (cookie + X-CSRF-Token header), per-IP/route rate limiting,
+    strict CSP + security headers, request IDs, JSON structured logging.
+  version: 1.0.0
+  contact:
+    name: CloudCostLens
+    url: https://github.com/vivek01-ops/CloudCostLens
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: /
+    description: Local/Deployed instance
+
+tags:
+  - name: Auth
+    description: Authentication and session state
+  - name: Data
+    description: Cost and resource data (read-only)
+  - name: Diagnostics
+    description: Cloud connection diagnostics (read-only)
+  - name: System
+    description: Health/readiness and infra checks
+
+components:
+  securitySchemes:
+    csrfCookie:
+      type: apiKey
+      in: cookie
+      name: ccl_csrf
+      description: CSRF token stored in signed cookie; required for non-safe methods.
+    csrfHeader:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: Must match csrfCookie for POST/PUT/PATCH/DELETE on /api/*.
+  schemas:
+    AuthMe:
+      type: object
+      properties:
+        identity: { type: string, nullable: true }
+        logged_in: { type: boolean }
+        provider: { type: string, enum: [demo, aws, azure] }
+        region: { type: string, nullable: true }
+        role: { type: string, nullable: true }
+        subscription: { type: string, nullable: true }
+    DailyPoint:
+      type: object
+      required: [date, amount]
+      properties:
+        date: { type: string, format: date }
+        amount: { type: number }
+    ServiceBreakdown:
+      type: object
+      required: [service, amount]
+      properties:
+        service: { type: string }
+        amount: { type: number }
+    CostsResponse:
+      type: object
+      required: [currency, days, total, daily, by_service]
+      properties:
+        currency: { type: string }
+        days: { type: integer }
+        total: { type: number }
+        daily: { type: array, items: { $ref: '#/components/schemas/DailyPoint' } }
+        by_service: { type: array, items: { $ref: '#/components/schemas/ServiceBreakdown' } }
+    ResourceRecommendation:
+      type: object
+      required: [action, reason, monthly_savings, confidence]
+      properties:
+        action: { type: string, enum: [terminate, stop, delete, release, keep] }
+        reason: { type: string }
+        monthly_savings: { type: number }
+        confidence: { type: string, enum: [low, medium, high] }
+    Resource:
+      type: object
+      required: [id, name, kind, state, detail, monthly_cost, cpu, recommendation]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        kind: { type: string }
+        state: { type: string }
+        detail: { type: string }
+        monthly_cost: { type: number }
+        cpu: { type: number, nullable: true }
+        recommendation: { $ref: '#/components/schemas/ResourceRecommendation' }
+    ResourcesResponse:
+      type: object
+      required: [scope, resources, actionable, monthly_savings, warnings]
+      properties:
+        scope: { type: string }
+        resources: { type: array, items: { $ref: '#/components/schemas/Resource' } }
+        actionable: { type: integer }
+        monthly_savings: { type: number }
+        warnings: { type: array, items: { type: string } }
+    CheckItem:
+      type: object
+      required: [name, ok, detail, error]
+      properties:
+        name: { type: string }
+        ok: { type: boolean }
+        detail: { type: string, nullable: true }
+        error: { type: string, nullable: true }
+    RequiredAccess:
+      type: object
+      required: [name, purpose, present]
+      properties:
+        name: { type: string }
+        purpose: { type: string }
+        present: { type: boolean, nullable: true }
+    UserRole:
+      type: object
+      properties:
+        role: { type: string }
+        scope: { type: string, nullable: true }
+        scope_type: { type: string, nullable: true }
+        principal_id: { type: string, nullable: true }
+        principal_type: { type: string, nullable: true }
+    RoleAssignment:
+      type: object
+      properties:
+        role: { type: string }
+        principal_id: { type: string }
+        principal_type: { type: string }
+        is_you: { type: boolean }
+        scope: { type: string }
+    Permissions:
+      type: object
+      properties:
+        actions: { type: array, items: { type: string } }
+        error: { type: string, nullable: true }
+    DiagnosticsResponse:
+      type: object
+      required: [provider, scope, tenant, current_principal, role, identity, subscription, roles, roles_error, user_roles, user_roles_error, permissions, checks, required_access, hint]
+      properties:
+        provider: { type: string, enum: [demo, aws, azure] }
+        scope: { type: string, nullable: true }
+        tenant: { type: string, nullable: true }
+        current_principal: { type: string, nullable: true }
+        role: { type: string, nullable: true }
+        identity: { type: object, nullable: true }
+        subscription: { type: object, nullable: true }
+        roles: { type: array, items: { $ref: '#/components/schemas/RoleAssignment' } }
+        roles_error: { type: string, nullable: true }
+        user_roles: { type: array, items: { $ref: '#/components/schemas/UserRole' } }
+        user_roles_error: { type: string, nullable: true }
+        permissions: { $ref: '#/components/schemas/Permissions' }
+        checks: { type: array, items: { $ref: '#/components/schemas/CheckItem' } }
+        required_access: { type: array, items: { $ref: '#/components/schemas/RequiredAccess' } }
+        hint: { type: string, nullable: true }
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok] }
+    ReadyResponse:
+      type: object
+      required: [status, store, aws_cli, az_cli]
+      properties:
+        status: { type: string, enum: [ok, not_ready] }
+        store: { type: boolean }
+        aws_cli: { type: boolean }
+        az_cli: { type: boolean }
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        retry_after: { type: integer, nullable: true }
+    MessageResponse:
+      type: object
+      required: [message]
+      properties:
+        message: { type: string }
+
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: Liveness probe
+      description: Returns OK if app is alive.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+  /ready:
+    get:
+      tags: [System]
+      summary: Readiness probe
+      description: Checks SQLite store ping and CLI availability; returns 200 if ready, 503 if not.
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadyResponse' }
+        '503':
+          description: Not ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadyResponse' }
+  /:
+    get:
+      tags: [System]
+      summary: Dashboard UI
+      description: Returns HTML dashboard (redirects to /login if not authenticated).
+      responses:
+        '200':
+          description: HTML
+          content:
+            text/html: {}
+        '302':
+          description: Redirect to /login
+  /login:
+    get:
+      tags: [Auth]
+      summary: Login UI
+      description: Returns HTML login page.
+      responses:
+        '200':
+          description: HTML
+          content:
+            text/html: {}
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current session info
+      responses:
+        '200':
+          description: Current user/session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthMe' }
+  /api/auth/demo:
+    post:
+      tags: [Auth]
+      summary: Start demo session
+      security:
+        - csrfCookie: []
+        - csrfHeader: []
+      responses:
+        '200':
+          description: Session started
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageResponse' }
+        '403':
+          description: CSRF mismatch
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Start cloud CLI login (AWS or Azure)
+      security:
+        - csrfCookie: []
+        - csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider]
+              properties:
+                provider: { type: string, enum: [aws, azure] }
+                profile: { type: string, nullable: true }
+                region: { type: string, nullable: true }
+      responses:
+        '200':
+          description: Login job accepted or state returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageResponse' }
+        '403': { description: CSRF mismatch }
+        '429': { description: Rate limited }
+  /api/auth/check:
+    post:
+      tags: [Auth]
+      summary: Sign in with existing cloud credentials (no login triggered)
+      security:
+        - csrfCookie: []
+        - csrfHeader: []
+      responses:
+        '200':
+          description: Status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [running, connected, failed, idle, not_found] }
+                  provider: { type: string, enum: [aws, azure, demo], nullable: true }
+                  message: { type: string, nullable: true }
+        '403': { description: CSRF mismatch }
+        '429': { description: Rate limited }
+  /api/auth/subscription:
+    post:
+      tags: [Auth]
+      summary: Select Azure subscription
+      security:
+        - csrfCookie: []
+        - csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+      responses:
+        '200':
+          description: Subscription set
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageResponse' }
+        '403': { description: CSRF mismatch }
+        '429': { description: Rate limited }
+  /api/auth/sso/select:
+    post:
+      tags: [Auth]
+      summary: Complete AWS SSO selection
+      security:
+        - csrfCookie: []
+        - csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account, role]
+              properties:
+                account: { type: string }
+                role: { type: string }
+      responses:
+        '200': { description: SSO selection accepted }
+        '400': { description: Missing account/role or no pending SSO login }
+        '403': { description: CSRF mismatch }
+        '429': { description: Rate limited }
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout current session
+      security:
+        - csrfCookie: []
+        - csrfHeader: []
+      responses:
+        '200':
+          description: Logged out
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageResponse' }
+        '403': { description: CSRF mismatch }
+        '429': { description: Rate limited }
+  /api/costs:
+    get:
+      tags: [Data]
+      summary: Cost data (read-only)
+      description: Returns daily spend trend and service breakdown for selected range. Supports ?force=1 to bypass TTL cache.
+      parameters:
+        - in: query
+          name: force
+          schema: { type: string, enum: ['0', '1'] }
+          required: false
+      responses:
+        '200':
+          description: Cost data
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CostsResponse' }
+        '401': { description: Unauthorized }
+        '429':
+          description: Throttled by cloud provider
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500': { description: Internal error (includes reference id) }
+  /api/resources:
+    get:
+      tags: [Data]
+      summary: Resource inventory + recommendations (read-only)
+      description: Returns resources and right-sizing recommendations. Supports ?force=1 to bypass TTL cache.
+      parameters:
+        - in: query
+          name: force
+          schema: { type: string, enum: ['0', '1'] }
+          required: false
+      responses:
+        '200':
+          description: Resources
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResourcesResponse' }
+        '401': { description: Unauthorized }
+        '429':
+          description: Throttled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500': { description: Internal error }
+  /api/diagnostics:
+    get:
+      tags: [Diagnostics]
+      summary: Connection diagnostics (read-only)
+      description: Read-only health checks for current cloud connection (tokens, permissions, API checks). Supports ?force=1.
+      parameters:
+        - in: query
+          name: force
+          schema: { type: string, enum: ['0', '1'] }
+          required: false
+      responses:
+        '200':
+          description: Diagnostics
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiagnosticsResponse' }
+        '401': { description: Unauthorized }
+        '429':
+          description: Throttled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500': { description: Internal error }
+  /api/auth/install:
+    post:
+      tags: [Auth]
+      summary: Install a cloud CLI locally (no sudo)
+      security:
+        - csrfCookie: []
+        - csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider]
+              properties:
+                provider: { type: string, enum: [aws, azure] }
+      responses:
+        '200': { description: Install job started }
+        '403': { description: CSRF mismatch }
+        '429': { description: Rate limited }
+  /api/auth/install-status:
+    get:
+      tags: [Auth]
+      summary: Poll local CLI install progress
+      responses:
+        '200':
+          description: Install status
+          content:
+            application/json:
+              schema: { type: object, properties: { status: { type: string }, output: { type: string } } }
+  /api/auth/status:
+    get:
+      tags: [Auth]
+      summary: Poll AWS/Azure login status/output
+      responses:
+        '200':
+          description: Login status
+          content:
+            application/json:
+              schema: { type: object, properties: { status: { type: string }, output: { type: string } } }
+  /api/auth/code:
+    post:
+      tags: [Auth]
+      summary: Submit authorization code for `aws login --remote`
+      security:
+        - csrfCookie: []
+        - csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        '200': { description: Code submitted }
+        '403': { description: CSRF mismatch }
+        '429': { description: Rate limited }
+  /api/auth/sso/roles:
+    post:
+      tags: [Auth]
+      summary: List AWS SSO roles for an account
+      security:
+        - csrfCookie: []
+        - csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account]
+              properties:
+                account: { type: string }
+      responses:
+        '200':
+          description: Roles
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  roles: { type: array, items: { type: string } }
+        '403': { description: CSRF mismatch }
+        '429': { description: Rate limited }
+security: []

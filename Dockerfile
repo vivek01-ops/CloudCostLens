@@ -8,6 +8,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=5000 \
     DEMO_MODE=1 \
+    DATA_DIR=/app/data \
     AWS_REGION=us-east-1 \
     COST_DAYS=30 \
     HOME=/home/appuser \
@@ -44,14 +45,15 @@ COPY . .
 
 # Non-root runtime user with a writable HOME for ~/.aws, ~/.azure and ~/.local.
 RUN useradd -m -u 10001 appuser \
- && mkdir -p /home/appuser/.aws /home/appuser/.azure /home/appuser/.local/bin \
+ && mkdir -p /home/appuser/.aws /home/appuser/.azure /home/appuser/.local/bin /app/data \
  && chown -R appuser:appuser /home/appuser /app
 USER appuser
 
 EXPOSE 5000
 
+# Readiness (not liveness): also confirms the SQLite store is reachable.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=4).status == 200 else 1)"]
+  CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/ready', timeout=4).status == 200 else 1)"]
 
 # IMPORTANT: keep --workers 1. Login and CLI-install state is held in memory,
 # so multiple worker processes would not share sessions. Threads handle concurrency.

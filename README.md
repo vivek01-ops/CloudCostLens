@@ -78,6 +78,34 @@ Read-only permissions needed:
 
 Nothing is ever modified in either cloud — this is read-only and only recommends actions.
 
+## Security, persistence & production
+
+- **CSRF**: Per-session CSRF token stored in a signed cookie; mutating endpoints require the `X-CSRF-Token` header (auto-injected by `static/csrf.js`).
+- **Security headers/CSP**: Strict CSP with a per-request nonce for inline scripts, HSTS (when cookies are secure), `frame-ancestors 'none'`, nosniff, Referrer-Policy, Permissions-Policy, COOP same-origin.
+- **Rate limiting**: Sliding-window, per-IP/route, SQLite-backed; returns `429` with `Retry-After` when exhausted.
+- **Structured logging**: JSON request logs with `X-Request-ID`; secrets/tokens are redacted.
+- **Persistence**: Login sessions stored in SQLite at `DATA_DIR/sessions.db` (WAL) and rehydrated across restarts; sessions older than 7 days are pruned on startup.
+- **TTL caching**: Costs/resources/diagnostics cached in memory (300s/120s/120s) with `?force=1` bypass for UI refresh.
+- **Bounded concurrency**: Login jobs use a thread pool + semaphore (max pending logins) with timeouts; reader threads release slots on termination.
+- **Health/ready**: `GET /health` (liveness) and `GET /ready` (readiness: SQLite store OK, CLI binaries available).
+- **Theme & a11y**: Dark mode (persisted via `localStorage`, respects `prefers-color-scheme`), skip link, landmarks, `:focus-visible`, `aria-live`/`aria-busy`, drawer focus-trap, and `prefers-reduced-motion`; Chart.js is self-hosted.
+
+## API docs
+
+The OpenAPI 3.0 spec is in [`openapi.yaml`](openapi.yaml) (endpoints, schemas, security, rate limiting, error shapes).
+
+## Configuration
+
+Key environment variables (see `.env.example`):
+
+- `DEMO_MODE` (default `1`) — show/hide the demo login; when `0`, `SECRET_KEY` is required.
+- `SECRET_KEY` — required in non-demo mode; the app raises on startup if missing/empty when `DEMO_MODE=0`.
+- `COOKIE_SECURE` — defaults to `not DEMO_MODE`; enable in HTTPS deployments.
+- `FLASK_DEBUG` — default `0` (do not enable in production).
+- `DATA_DIR` — directory for the SQLite store (`sessions.db`), defaults to `<repo>/data`.
+- `PORT`, `AWS_REGION`, `AWS_PROFILE`, `AWS_CLI_BIN`, `AZ_CLI_BIN`, `COST_DAYS`.
+- Boolean env values accept `true/1/yes/y/on` (case-insensitive).
+
 ## Run with Docker
 
 The image bakes in Flask **and both CLIs** (AWS CLI v2 + Azure CLI), so it works out of the box:
@@ -90,8 +118,8 @@ It defaults to **demo mode**. To target real clouds, copy `.env.example` to `.en
 `DEMO_MODE=0`, then re-run. `.env` is read automatically (`DEMO_MODE`, `AWS_REGION`,
 `COST_DAYS`, `SECRET_KEY`, `AWS_PROFILE`, ...); the host port follows `PORT` (default 5000).
 
-CLI credentials and installs persist in named volumes (`aws-credentials`, `azure-credentials`,
-`cli-tools`). The container has no browser, so use **Headless** for AWS and the device-code
+CLI credentials, installs, and the SQLite session store persist in named volumes
+(`aws-credentials`, `azure-credentials`, `cli-tools`, `data` mounted at `DATA_DIR=/app/data`). The container has no browser, so use **Headless** for AWS and the device-code
 flow for Azure — the app shows the sign-in URL/code on the page. To reuse credentials already
 on the host instead:
 
@@ -101,8 +129,9 @@ volumes:
   - ${HOME}/.azure:/home/appuser/.azure:ro
 ```
 
-The container runs as a non-root user under a **single** Gunicorn worker (login/install state
-is in-memory) with threads, and exposes a `/health` healthcheck.
+The container runs as a non-root user under Gunicorn (`--workers 1 --threads 8`; login/install
+state is in-memory, while sessions are persisted to SQLite). It exposes both `/health`
+(liveness) and `/ready` (readiness) probes.
 
 ## Endpoints
 
@@ -124,13 +153,16 @@ is in-memory) with threads, and exposes a `/health` healthcheck.
 | `GET /api/costs` | daily spend + spend by service + total |
 | `GET /api/resources` | resources with usage + recommendation + savings |
 | `GET /api/diagnostics` | read-only connection checks: tenant/subscription, role assignments, effective permissions, per-source API status, required roles |
-| `GET /health` | health / demo flag / CLI availability |
+| `GET /health` | liveness probe (`{status: ok}`) |
+| `GET /ready` | readiness probe: SQLite store + CLI availability (200/503) |
+
+The full request/response contract is described in [`openapi.yaml`](openapi.yaml).
 
 ## Notes
 
-- Login state is held **in memory** in the Flask process (fine for a small single-process app —
-  the Docker image therefore runs Gunicorn with `--workers 1`).
+- Login *process* state (running CLIs, streamed output) is held **in memory**, so the Docker
+  image runs Gunicorn with a single worker. Persisted **sessions** live in SQLite, so logins
+  survive restarts; set a fixed `SECRET_KEY` to keep browser cookies valid across restarts.
 - AWS `aws login` credentials auto-refresh for up to 12 hours; Azure tokens refresh via the CLI.
-- Set a fixed `SECRET_KEY` if you restart often, so browser sessions survive.
 - Cost Explorer bills $0.01 per request; Cost Management queries are free.
 - Azure data is scoped to the selected subscription; AWS data to the single region shown.

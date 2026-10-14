@@ -8,6 +8,7 @@ __pycache__
 
 # Secrets and local config (passed at runtime instead)
 .env
+data
 
 # Docker meta (not part of the app)
 Dockerfile

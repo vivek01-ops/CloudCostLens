@@ -17,7 +17,10 @@ Set DEMO_MODE=1 (default) to also allow a no-cloud demo login for local testing.
 
 from __future__ import annotations
 
+import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
+import logging
 import os
 import platform
 import random
@@ -28,20 +31,363 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
+import uuid
 import zipfile
 from datetime import UTC, datetime, timedelta
 
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, g, jsonify, redirect, render_template, request, session, url_for
+from werkzeug.exceptions import HTTPException
 
-app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
+import store
 
-DEMO_MODE = os.getenv("DEMO_MODE", "1").lower() in {"1", "true", "yes", "on"}
+# ------------------------------------------------------------------- environment
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+DEMO_MODE = _env_bool("DEMO_MODE", True)
+FLASK_DEBUG = _env_bool("FLASK_DEBUG", False)
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_CLI_BIN = os.getenv("AWS_CLI_BIN", "aws")
 AZ_CLI_BIN = os.getenv("AZ_CLI_BIN", "az")
 COST_DAYS = int(os.getenv("COST_DAYS", "30"))
+DATA_DIR = os.path.abspath(os.getenv("DATA_DIR", os.path.join(os.path.dirname(__file__), "data")))
+
+SECRET_KEY = os.getenv("SECRET_KEY", "")
+if not SECRET_KEY:
+    if DEMO_MODE:
+        # Ephemeral key is fine for the no-cloud demo; sessions reset on restart.
+        SECRET_KEY = secrets.token_hex(32)
+    else:
+        raise RuntimeError(
+            "SECRET_KEY must be set when DEMO_MODE=0. Generate one with: "
+            "python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+
+store.init(DATA_DIR)
+try:
+    store.prune_sessions(7 * 24 * 3600)
+except Exception:  # noqa: BLE001 - cleanup is best-effort
+    pass
+
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=_env_bool("COOKIE_SECURE", not DEMO_MODE),
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+)
+
+# ------------------------------------------------------------------------ CSRF
+# A random per-session token is embedded in every rendered page (meta tag) and
+# echoed back in the X-CSRF-Token header on state-changing requests. The token is
+# stored in the signed session cookie, so a cross-site page cannot read it.
+_CSRF_HEADER = "X-CSRF-Token"
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
+
+
+def _csrf_token() -> str:
+    token = session.get("csrf")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf"] = token
+    return token
+
+
+@app.context_processor
+def _inject_csrf() -> dict:
+    return {"csrf_token": _csrf_token()}
+
+
+@app.before_request
+def _csrf_protect():
+    if request.method in _SAFE_METHODS or not request.path.startswith("/api/"):
+        return None
+    expected = session.get("csrf")
+    sent = request.headers.get(_CSRF_HEADER)
+    if not expected or not sent or not secrets.compare_digest(str(sent), str(expected)):
+        return jsonify(error="Invalid or missing CSRF token. Reload the page and try again."), 403
+    return None
+
+
+# ------------------------------------------------------------- rate limiting
+# Sliding-window limits (per client IP) on the auth endpoints that spawn CLI or
+# cloud calls. Interactive GET polling (/api/auth/status, /install-status) is not
+# throttled. Two tiers: credential/process-spawning endpoints are tighter than
+# the rest of the auth surface.
+_RATE_TIERS = {
+    "/api/auth/login": (10, 60),
+    "/api/auth/check": (10, 60),
+    "/api/auth/code": (15, 60),
+    "/api/auth/subscription": (10, 60),
+    "/api/auth/sso/roles": (30, 60),
+    "/api/auth/sso/select": (15, 60),
+}
+_RATE_DEFAULT_AUTH_POST = (40, 60)
+
+
+@app.before_request
+def _rate_limit_guard():
+    if request.method != "POST" or not request.path.startswith("/api/auth/"):
+        return None
+    limit, window = _RATE_TIERS.get(request.path, _RATE_DEFAULT_AUTH_POST)
+    key = f"{request.path}:{request.remote_addr or 'unknown'}"
+    allowed, retry = store.rate_limit(key, limit, window)
+    if not allowed:
+        resp = jsonify(error="Too many requests. Please wait a moment and try again.")
+        resp.status_code = 429
+        resp.headers["Retry-After"] = str(retry)
+        return resp
+    return None
+
+
+# ------------------------------------------------------- security headers / CSP
+@app.before_request
+def _security_nonce():
+    g.csp_nonce = secrets.token_urlsafe(16)
+    return None
+
+
+@app.context_processor
+def _inject_nonce() -> dict:
+    return {"csp_nonce": getattr(g, "csp_nonce", "")}
+
+
+@app.after_request
+def _security_headers(resp):
+    nonce = getattr(g, "csp_nonce", "")
+    script_src = f"script-src 'self' 'nonce-{nonce}'" if nonce else "script-src 'self'"
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "; ".join(
+            [
+                "default-src 'self'",
+                script_src,
+                "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+                "font-src 'self' https://fonts.gstatic.com",
+                "img-src 'self' data:",
+                "connect-src 'self'",
+                "object-src 'none'",
+                "base-uri 'self'",
+                "form-action 'self'",
+                "frame-ancestors 'none'",
+            ]
+        ),
+    )
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=(), payment=()")
+    resp.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    if app.config.get("SESSION_COOKIE_SECURE"):
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return resp
+
+
+# ------------------------------------------------------- request id + access log
+@app.before_request
+def _assign_request_id():
+    g.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:16]
+    g.request_start = time.time()
+    return None
+
+
+@app.after_request
+def _log_request(resp):
+    rid = getattr(g, "request_id", "")
+    if rid:
+        resp.headers.setdefault("X-Request-ID", rid)
+    if request.path.startswith("/static/"):
+        return resp
+    start = getattr(g, "request_start", None)
+    log.info(
+        "request",
+        extra={
+            "event": "request",
+            "request_id": rid,
+            "method": request.method,
+            "path": request.path,
+            "status": resp.status_code,
+            "ms": round((time.time() - start) * 1000, 1) if start else None,
+            "remote": request.remote_addr,
+        },
+    )
+    return resp
+
+
+# ------------------------------------------------------------- error handling
+def _wants_json() -> bool:
+    return request.path.startswith("/api/") or request.accept_mimetypes.best == "application/json"
+
+
+@app.errorhandler(404)
+def _handle_404(exc):
+    if _wants_json():
+        return jsonify(error="Not found"), 404
+    return "<h1>404 Not Found</h1>", 404
+
+
+@app.errorhandler(405)
+def _handle_405(exc):
+    if _wants_json():
+        return jsonify(error="Method not allowed"), 405
+    return "<h1>405 Method Not Allowed</h1>", 405
+
+
+@app.errorhandler(Exception)
+def _handle_exception(exc):
+    if isinstance(exc, HTTPException) and exc.code and exc.code < 500:
+        return exc
+    rid = getattr(g, "request_id", "")
+    log.exception(
+        "unhandled exception", extra={"event": "error", "request_id": rid, "path": request.path}
+    )
+    message = f"Internal server error. Reference: {rid}" if rid else "Internal server error."
+    if _wants_json():
+        return jsonify(error=message), 500
+    return f"<h1>500 Internal Server Error</h1><p>{message}</p>", 500
+
+
+# -------------------------------------------------------------------- logging
+# One-line JSON logs on stdout (gunicorn-friendly). Every log record carries a
+# request_id when there is one, so a single user action can be traced end to end.
+# Values that look like secrets are redacted before they are written.
+_REDACT_PATTERNS = [
+    (re.compile(r"Bearer\s+[A-Za-z0-9._\-]+", re.I), "Bearer ***"),
+    (
+        re.compile(
+            r'(?<![A-Za-z0-9_])((?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret'
+            r'|authorization|password|secret|api[_-]?key)["\']?\s*[:=]\s*["\']?)([^"\'\s,}]+)',
+            re.I,
+        ),
+        r"\1***",
+    ),
+]
+
+
+def _redact(text: str) -> str:
+    if not text:
+        return text
+    if "SECRET_KEY" in globals() and SECRET_KEY:
+        text = text.replace(SECRET_KEY, "***")
+    for pattern, repl in _REDACT_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+_RESERVED_LOG_KEYS = {
+    "name", "msg", "args", "levelname", "levelno", "pathname", "filename", "module",
+    "exc_info", "exc_text", "stack_info", "lineno", "funcName", "created", "msecs",
+    "relativeCreated", "thread", "threadName", "processName", "process", "taskName",
+    "message", "asctime",
+}
+
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": datetime.fromtimestamp(record.created, UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": _redact(record.getMessage()),
+        }
+        for key, value in record.__dict__.items():
+            if key not in _RESERVED_LOG_KEYS and not key.startswith("_"):
+                payload[key] = value
+        if record.exc_info:
+            payload["exc"] = _redact(self.formatException(record.exc_info))
+        return json.dumps(payload, default=str)
+
+
+log = logging.getLogger("cloudcostlens")
+if not getattr(log, "_ccl_configured", False):
+    log.setLevel(logging.INFO)
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(_JsonFormatter())
+    log.addHandler(_handler)
+    log.propagate = False
+    log._ccl_configured = True
+
+
+# ------------------------------------------------------------------- resilience
+# Cloud APIs (Azure Cost Management in particular) intermittently return HTTP 429
+# "Too many requests". We retry with the server-provided Retry-After when present,
+# a small exponential backoff otherwise, and surface a clean 429 to the UI once the
+# retries are exhausted. Read snapshots are also memoised briefly so a page refresh
+# does not hammer the APIs.
+class CloudThrottled(Exception):
+    """Cloud provider is throttling us and retries were exhausted."""
+
+    def __init__(self, message: str, retry_after: int = 15):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+_RETRY_STATUS_RE = re.compile(r"(?:^|\D)(429|too many requests|throttl)", re.I)
+_RETRY_AFTER_RE = re.compile(r"retry[-_]after[\"'\s:]+(\d+)", re.I)
+
+# Ceiling on a single backoff sleep, so one unlucky request cannot hang a worker.
+_MAX_BACKOFF = 20.0
+
+
+def _retry_after_seconds(text: str) -> float | None:
+    """Return how long to wait if `text` describes a throttle, else None."""
+    if not text or not _RETRY_STATUS_RE.search(text):
+        return None
+    match = _RETRY_AFTER_RE.search(text)
+    if match:
+        try:
+            return min(float(match.group(1)), _MAX_BACKOFF)
+        except ValueError:
+            pass
+    return 5.0
+
+
+def _error_response(exc: Exception, status: int = 502):
+    """Turn a caught exception into a JSON response, mapping throttles to 429."""
+    if isinstance(exc, CloudThrottled):
+        resp = jsonify(error=str(exc) or "Cloud provider is throttling requests.", retry_after=exc.retry_after)
+        resp.status_code = 429
+        resp.headers["Retry-After"] = str(exc.retry_after)
+        return resp
+    return jsonify(error=_cloud_error(exc)), status
+
+
+_TTL_CACHE: dict[str, tuple[float, object]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _cache_get(key: str):
+    with _CACHE_LOCK:
+        entry = _TTL_CACHE.get(key)
+        if entry is not None and time.time() < entry[0]:
+            return entry[1]
+    return None
+
+
+def _cache_set(key: str, value: object, ttl: int) -> None:
+    with _CACHE_LOCK:
+        _TTL_CACHE[key] = (time.time() + ttl, value)
+
+
+def _cached(key: str, ttl: int, force: bool, producer):
+    """Return a cached value for `key`, or compute + store it via `producer`."""
+    if not force:
+        hit = _cache_get(key)
+        if hit is not None:
+            return hit
+    value = producer()
+    _cache_set(key, value, ttl)
+    return value
+
 
 # AWS IAM Identity Center (SSO) profile/session we manage for in-app SSO login.
 AWS_SSO_SESSION = "cloudcostlens"
@@ -99,6 +445,14 @@ _logins: dict[str, dict] = {}    # sid -> {"provider", "identity", "subscription
 _procs: dict[str, dict] = {}     # sid -> running CLI login process state
 _installs: dict[str, dict] = {}  # sid -> CLI install job state
 
+# CLI work is bounded so a burst of requests cannot spawn unbounded threads/processes.
+# Installs run on a small pool; logins are capped by a semaphore and killed after a
+# generous timeout so a stuck `aws/az login` cannot pin a thread forever.
+_INSTALL_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ccl-install")
+_MAX_PENDING_LOGINS = 6
+_LOGIN_SLOTS = threading.BoundedSemaphore(_MAX_PENDING_LOGINS)
+_LOGIN_TIMEOUT_SECONDS = 900
+
 
 def _sid() -> str:
     sid = session.get("sid")
@@ -109,7 +463,37 @@ def _sid() -> str:
 
 
 def _current() -> dict | None:
-    return _logins.get(session.get("sid", ""))
+    sid = session.get("sid", "")
+    if not sid:
+        return None
+    state = _logins.get(sid)
+    if state is not None:
+        return state
+    # Not in this worker's memory (e.g. after a restart or on another future
+    # worker) — fall back to the shared SQLite store and rehydrate the cache.
+    state = store.load_session(sid)
+    if state is not None:
+        with _lock:
+            _logins[sid] = state
+    return state
+
+
+def _set_login(sid: str, state: dict) -> None:
+    with _lock:
+        _logins[sid] = state
+    try:
+        store.save_session(sid, state)
+    except Exception:  # noqa: BLE001 - persistence must never break login
+        log.exception("failed to persist session", extra={"event": "error", "sid": sid})
+
+
+def _clear_login(sid: str) -> None:
+    with _lock:
+        _logins.pop(sid, None)
+    try:
+        store.delete_session(sid)
+    except Exception:  # noqa: BLE001
+        log.exception("failed to delete session", extra={"event": "error", "sid": sid})
 
 
 # --------------------------------------------------------------------- recommendations
@@ -305,8 +689,7 @@ def _aws_sso_commit(sid: str, region: str, start_url: str, account: str, role: s
                 f"account {account} / role {role}."
             )
         }
-    with _lock:
-        _logins[sid] = {"provider": "aws", "identity": identity, "profile": profile, "sso": True}
+    _set_login(sid, {"provider": "aws", "identity": identity, "profile": profile, "sso": True})
     return "ok", {"identity": identity}
 
 
@@ -423,14 +806,29 @@ def _fetch_resources_aws(profile: str | None = None) -> list[dict]:
 # ========================================================================= Azure
 
 
+def _az_exec(args: list[str], timeout: int, retries: int = 3) -> subprocess.CompletedProcess:
+    """Run an az command, retrying transient 429 throttling with backoff."""
+    message = "az command failed"
+    wait: float | None = None
+    for attempt in range(retries + 1):
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        if proc.returncode == 0:
+            return proc
+        message = (proc.stderr or proc.stdout or "az command failed").strip()
+        wait = _retry_after_seconds(message)
+        if wait is None or attempt == retries:
+            break
+        time.sleep(wait)
+    if wait is not None:
+        raise CloudThrottled(f"Cloud provider is throttling requests. {message}", retry_after=int(wait))
+    raise RuntimeError(message)
+
+
 def _az_run(args: list[str], timeout: int = 120) -> object:
     az = _az_cli_path()
     if not az:
         raise RuntimeError("Azure CLI (az) not found.")
-    proc = subprocess.run([az, *args], capture_output=True, text=True, timeout=timeout)
-    if proc.returncode != 0:
-        message = (proc.stderr or proc.stdout or "az command failed").strip()
-        raise RuntimeError(message)
+    proc = _az_exec([az, *args], timeout)
     if not proc.stdout.strip():
         return None
     return json.loads(proc.stdout)
@@ -448,13 +846,21 @@ def _az_rest(url: str, body: dict | None = None, method: str = "post") -> dict:
             body_path = fh.name
         args += ["--body", f"@{body_path}"]
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=180)
+        proc = _az_exec(args, 180)
     finally:
         if body_path:
             os.unlink(body_path)
-    if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or proc.stdout or "az rest failed").strip())
-    return json.loads(proc.stdout or "{}")
+    data = json.loads(proc.stdout or "{}")
+    # `az rest` sometimes exits 0 while printing a throttling error body.
+    err = data.get("error") if isinstance(data, dict) else None
+    if isinstance(err, dict):
+        blob = f"{err.get('code', '')} {err.get('message', '')}"
+        if _retry_after_seconds(blob) is not None:
+            raise CloudThrottled(
+                "Cloud provider is throttling requests. " + _cloud_error(RuntimeError(json.dumps(data))),
+                retry_after=10,
+            )
+    return data
 
 
 def _az_identity(subscription_id: str | None = None) -> dict | None:
@@ -941,21 +1347,41 @@ def _run_install(sid: str, provider: str) -> None:
 # ============================================================================ auth
 
 
-def _reader(sid: str, proc: subprocess.Popen) -> None:
-    info = _procs.get(sid)
-    if info is None:
+def _kill_login(sid: str, proc: subprocess.Popen) -> None:
+    """Watchdog: terminate a login that has been waiting longer than the timeout."""
+    if proc.poll() is not None:
         return
+    try:
+        proc.terminate()
+    except Exception:  # noqa: BLE001
+        return
+    info = _procs.get(sid)
+    if info is not None:
+        with _lock:
+            info["output"].append(f"Login timed out after {_LOGIN_TIMEOUT_SECONDS // 60} minutes.")
+
+
+def _reader(sid: str, proc: subprocess.Popen) -> None:
+    timer = threading.Timer(_LOGIN_TIMEOUT_SECONDS, _kill_login, args=(sid, proc))
+    timer.daemon = True
+    timer.start()
     try:
         if proc.stdout is not None:
             for line in iter(proc.stdout.readline, ""):
-                with _lock:
-                    info["output"].append(line.rstrip())
-                    info["output"] = info["output"][-60:]
+                info = _procs.get(sid)
+                if info is not None:
+                    with _lock:
+                        info["output"].append(line.rstrip())
+                        info["output"] = info["output"][-60:]
         proc.wait()
     finally:
-        with _lock:
-            info["exit"] = proc.returncode
-            info["status"] = "ok" if proc.returncode == 0 else "error"
+        timer.cancel()
+        _LOGIN_SLOTS.release()
+        info = _procs.get(sid)
+        if info is not None:
+            with _lock:
+                info["exit"] = proc.returncode
+                info["status"] = "ok" if proc.returncode == 0 else "error"
 
 
 def _login_command(provider: str, opts: dict) -> list[str]:
@@ -995,8 +1421,7 @@ def _finalize_azure(sid: str, subscription: dict) -> dict:
         "user": None,
     }
     state = {"provider": "azure", "identity": identity, "subscription": subscription}
-    with _lock:
-        _logins[sid] = state
+    _set_login(sid, state)
     return identity
 
 
@@ -1040,8 +1465,7 @@ def _finalize_login(sid: str, provider: str):
         identity = _aws_identity()
         if not identity:
             return "error", {"error": "`aws login` finished but credentials are not usable yet."}
-        with _lock:
-            _logins[sid] = {"provider": "aws", "identity": identity}
+        _set_login(sid, {"provider": "aws", "identity": identity})
         return "ok", {"identity": identity}
 
     # azure
@@ -1087,8 +1511,7 @@ def auth_check():
         identity = _aws_identity()
         if not identity:
             return jsonify(ok=False, error="No usable AWS credentials found."), 400
-        with _lock:
-            _logins[_sid()] = {"provider": "aws", "identity": identity}
+        _set_login(_sid(), {"provider": "aws", "identity": identity})
         return jsonify(ok=True, provider="aws", identity=identity)
 
     if provider == "azure":
@@ -1118,7 +1541,7 @@ def install_cli():
         if _installs.get(sid, {}).get("status") == "running":
             return jsonify(status="running")
         _installs[sid] = {"status": "running", "output": [f"Target: {_install_dir_summary(provider)}"]}
-    threading.Thread(target=_run_install, args=(sid, provider), daemon=True).start()
+    _INSTALL_POOL.submit(_run_install, sid, provider)
     return jsonify(status="started", provider=provider)
 
 
@@ -1148,7 +1571,15 @@ def auth_login():
     except Exception as exc:  # noqa: BLE001
         return jsonify(error=str(exc)), 400
 
+    if not _LOGIN_SLOTS.acquire(blocking=False):
+        return jsonify(error="Too many sign-in attempts are in progress. Please wait a moment and try again."), 429
     with _lock:
+        old = _procs.get(sid)
+        if old and old.get("proc") and old["proc"].poll() is None:
+            try:
+                old["proc"].terminate()
+            except Exception:  # noqa: BLE001
+                pass
         _procs[sid] = {"provider": provider, "proc": None, "output": [], "status": "running", "exit": None, "opts": data}
     try:
         proc = subprocess.Popen(
@@ -1160,6 +1591,7 @@ def auth_login():
             bufsize=1,
         )
     except OSError as exc:
+        _LOGIN_SLOTS.release()
         with _lock:
             _procs.pop(sid, None)
         return jsonify(error=f"Failed to start login: {exc}"), 500
@@ -1290,8 +1722,7 @@ def auth_subscription():
 def auth_demo():
     if not DEMO_MODE:
         return jsonify(error="Demo mode is disabled."), 400
-    with _lock:
-        _logins[_sid()] = {"provider": "demo", "identity": None}
+    _set_login(_sid(), {"provider": "demo", "identity": None})
     return jsonify(status="ok")
 
 
@@ -1305,6 +1736,7 @@ def auth_me():
         provider=state["provider"],
         identity=state.get("identity"),
         subscription=state.get("subscription"),
+        role=_role_label(state),
         region=AWS_REGION if state["provider"] == "aws" else None,
     )
 
@@ -1315,8 +1747,8 @@ def auth_logout():
     info = _procs.get(sid)
     if info and info.get("proc") and info["proc"].poll() is None:
         info["proc"].terminate()
+    _clear_login(sid)
     with _lock:
-        _logins.pop(sid, None)
         _procs.pop(sid, None)
     session.clear()
     return jsonify(status="ok")
@@ -1348,15 +1780,22 @@ def api_costs():
     state = _current()
     if not state:
         return jsonify(error="not authenticated"), 401
+    force = request.args.get("force") in {"1", "true", "yes"}
     try:
         if state["provider"] == "demo":
             daily, by_service, total = _demo_costs()
         elif state["provider"] == "aws":
-            daily, by_service, total = _fetch_costs_aws(state.get("profile"))
+            profile = state.get("profile")
+            daily, by_service, total = _cached(
+                f"aws:cost:{profile}:{COST_DAYS}", 300, force, lambda: _fetch_costs_aws(profile)
+            )
         else:
-            daily, by_service, total = _fetch_costs_azure(state["subscription"]["id"])
+            sub_id = state["subscription"]["id"]
+            daily, by_service, total = _cached(
+                f"az:cost:{sub_id}:{COST_DAYS}", 300, force, lambda: _fetch_costs_azure(sub_id)
+            )
     except Exception as exc:  # noqa: BLE001
-        return jsonify(error=_cloud_error(exc)), 502
+        return _error_response(exc)
     return jsonify(currency="USD", days=COST_DAYS, total=total, daily=daily, by_service=by_service)
 
 
@@ -1365,16 +1804,21 @@ def api_resources():
     state = _current()
     if not state:
         return jsonify(error="not authenticated"), 401
+    force = request.args.get("force") in {"1", "true", "yes"}
+    warnings: list[str] = []
     try:
-        warnings: list[str] = []
         if state["provider"] == "demo":
             resources = _demo_resources()
         elif state["provider"] == "aws":
-            resources = _fetch_resources_aws(state.get("profile"))
+            profile = state.get("profile")
+            resources = _cached(f"aws:res:{profile}", 120, force, lambda: _fetch_resources_aws(profile))
         else:
-            resources, warnings = _fetch_resources_azure(state["subscription"]["id"])
+            sub_id = state["subscription"]["id"]
+            resources, warnings = _cached(
+                f"az:res:{sub_id}", 120, force, lambda: _fetch_resources_azure(sub_id)
+            )
     except Exception as exc:  # noqa: BLE001
-        return jsonify(error=_cloud_error(exc)), 502
+        return _error_response(exc)
     actionable = [r for r in resources if r["recommendation"]["action"] != "keep"]
     monthly_savings = round(sum(r["recommendation"]["monthly_savings"] for r in actionable), 2)
     scope = AWS_REGION if state["provider"] in {"aws", "demo"} else (state.get("subscription") or {}).get("name")
@@ -1446,6 +1890,121 @@ def _disk_is_unattached(disk: dict) -> bool:
     return (raw or "").lower() == "unattached"
 
 
+_AZ_TOKEN_OID_CACHE: dict[str, tuple[float, str | None]] = {}
+_AZ_USER_ROLES_CACHE: dict[tuple[str, str], tuple[float, list]] = {}
+
+
+def _az_token_oid(subscription_id: str) -> str | None:
+    """Object ID (oid) of the principal the ARM token actually represents."""
+    now = time.time()
+    cached = _AZ_TOKEN_OID_CACHE.get(subscription_id)
+    if cached and now - cached[0] < 1800:
+        return cached[1]
+    oid = None
+    try:
+        data = _az_run(["account", "get-access-token", "--subscription", subscription_id, "-o", "json"])
+        token = (data or {}).get("accessToken") or ""
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        oid = claims.get("oid")
+    except Exception:  # noqa: BLE001
+        oid = None
+    _AZ_TOKEN_OID_CACHE[subscription_id] = (now, oid)
+    return oid
+
+
+def _az_scope_type(scope: str) -> str:
+    low = (scope or "").lower()
+    if "/resourcegroups/" in low:
+        return "Resource group"
+    if "microsoft.management/managementgroups" in low:
+        return "Management group"
+    if low.startswith("/subscriptions/"):
+        return "Subscription"
+    return "Other"
+
+
+def _az_user_roles(subscription_id: str, principal_id: str) -> list[dict]:
+    """Role assignments granted to a principal at the subscription scope (and inherited)."""
+    key = (subscription_id, principal_id)
+    now = time.time()
+    cached = _AZ_USER_ROLES_CACHE.get(key)
+    if cached and now - cached[0] < 120:
+        return [dict(r) for r in cached[1]]
+    url = (
+        f"https://management.azure.com/subscriptions/{subscription_id}"
+        "/providers/Microsoft.Authorization/roleAssignments"
+        f"?api-version=2022-04-01&$filter=assignedTo('{principal_id}')"
+    )
+    data = _az_rest(url, method="get") or {}
+    roles: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for a in data.get("value", []) or []:
+        props = a.get("properties") or {}
+        scope = props.get("scope") or ""
+        name = _az_role_name(subscription_id, props.get("roleDefinitionId") or "")
+        key = (name, scope)
+        if key in seen:
+            continue
+        seen.add(key)
+        roles.append({"role": name, "scope": scope, "scope_type": _az_scope_type(scope)})
+    _AZ_USER_ROLES_CACHE[(subscription_id, principal_id)] = (now, roles)
+    return roles
+
+
+def _aws_role_label(arn: str | None) -> str:
+    if not arn:
+        return "—"
+    if ":assumed-role/" in arn:
+        return arn.split(":assumed-role/", 1)[1].split("/", 1)[0] or "—"
+    if ":user/" in arn:
+        return "IAM user " + arn.split(":user/", 1)[1]
+    return "—"
+
+
+def _aws_user_roles(profile: str | None, arn: str | None) -> tuple[list[dict], str | None]:
+    policies: list[dict] = []
+    try:
+        iam = _boto3_client("iam", AWS_REGION, profile)
+        if ":assumed-role/" in (arn or ""):
+            role_name = arn.split(":assumed-role/", 1)[1].split("/", 1)[0]
+            for p in iam.list_attached_role_policies(RoleName=role_name).get("AttachedPolicies", []) or []:
+                policies.append({"role": p.get("PolicyName"), "scope": role_name, "scope_type": "Attached policy"})
+            for name in iam.list_role_policies(RoleName=role_name).get("PolicyNames", []) or []:
+                policies.append({"role": name, "scope": role_name, "scope_type": "Inline policy"})
+        elif ":user/" in (arn or ""):
+            user_name = arn.split(":user/", 1)[1]
+            for p in iam.list_attached_user_policies(UserName=user_name).get("AttachedPolicies", []) or []:
+                policies.append({"role": p.get("PolicyName"), "scope": user_name, "scope_type": "Attached policy"})
+            for name in iam.list_user_policies(UserName=user_name).get("PolicyNames", []) or []:
+                policies.append({"role": name, "scope": user_name, "scope_type": "Inline policy"})
+    except Exception as exc:  # noqa: BLE001
+        return policies, _cloud_error(exc)
+    return policies, None
+
+
+def _role_label(state: dict) -> str:
+    """Short human label of the role the current session is operating as."""
+    identity = state.get("identity") or {}
+    provider = state.get("provider")
+    if provider == "aws":
+        return _aws_role_label(identity.get("name"))
+    if provider == "azure":
+        subscription_id = (state.get("subscription") or {}).get("id")
+        if not subscription_id:
+            return "—"
+        oid = _az_token_oid(subscription_id)
+        if not oid:
+            return "—"
+        try:
+            roles = _az_user_roles(subscription_id, oid)
+        except Exception:  # noqa: BLE001
+            return "—"
+        return ", ".join(dict.fromkeys(r["role"] for r in roles)) or "—"
+    return "—"
+
+
 def _azure_checks(subscription_id: str) -> list[dict]:
     checks: list[dict] = [{"name": "Cost Management", "ok": False, "detail": "Query failed", "count": None, "error": None}]
     try:
@@ -1509,8 +2068,11 @@ def _diagnostics_azure(state: dict) -> dict:
         "subscription": sub,
         "tenant": sub.get("tenantId"),
         "current_principal": None,
+        "role": "—",
         "roles": [],
         "roles_error": None,
+        "user_roles": [],
+        "user_roles_error": None,
         "permissions": {"actions": [], "error": None},
         "checks": [],
         "required_access": [],
@@ -1520,7 +2082,7 @@ def _diagnostics_azure(state: dict) -> dict:
         result["hint"] = "No Azure subscription is selected for this session."
         return result
 
-    result["current_principal"] = _az_current_principal()
+    result["current_principal"] = _az_token_oid(subscription_id) or _az_current_principal()
 
     role_cache: dict[str, str] = {}
     try:
@@ -1543,6 +2105,13 @@ def _diagnostics_azure(state: dict) -> dict:
         result["roles"] = roles
     except Exception as exc:  # noqa: BLE001
         result["roles_error"] = _cloud_error(exc)
+
+    if result["current_principal"]:
+        try:
+            result["user_roles"] = _az_user_roles(subscription_id, result["current_principal"])
+        except Exception as exc:  # noqa: BLE001
+            result["user_roles_error"] = _cloud_error(exc)
+    result["role"] = ", ".join(dict.fromkeys(r["role"] for r in result["user_roles"])) or "—"
 
     try:
         result["permissions"]["actions"] = _az_permission_actions(subscription_id)
@@ -1592,6 +2161,10 @@ def _diagnostics_azure(state: dict) -> dict:
 
 def _diagnostics_aws(state: dict) -> dict:
     profile = state.get("profile")
+    identity = state.get("identity") or {}
+    arn = identity.get("name")
+    role = _aws_role_label(arn)
+    user_roles, user_roles_error = _aws_user_roles(profile, arn)
     checks: list[dict] = []
 
     try:
@@ -1633,8 +2206,11 @@ def _diagnostics_aws(state: dict) -> dict:
         "tenant": None,
         "subscription": None,
         "current_principal": None,
+        "role": role,
         "roles": [],
         "roles_error": None,
+        "user_roles": user_roles,
+        "user_roles_error": user_roles_error,
         "permissions": {"actions": [], "error": "IAM permissions cannot be enumerated from the caller's own credentials."},
         "checks": checks,
         "required_access": [
@@ -1654,11 +2230,14 @@ def api_diagnostics():
     state = _current()
     if not state:
         return jsonify(error="not authenticated"), 401
+    force = request.args.get("force") in {"1", "true", "yes"}
     try:
         if state["provider"] == "azure":
-            data = _diagnostics_azure(state)
+            sub_id = (state.get("subscription") or {}).get("id", "")
+            data = _cached(f"az:diag:{sub_id}", 120, force, lambda: _diagnostics_azure(state))
         elif state["provider"] == "aws":
-            data = _diagnostics_aws(state)
+            acct = (state.get("identity") or {}).get("account", "")
+            data = _cached(f"aws:diag:{acct}", 120, force, lambda: _diagnostics_aws(state))
         else:
             data = {
                 "provider": "demo",
@@ -1667,25 +2246,41 @@ def api_diagnostics():
                 "tenant": None,
                 "subscription": None,
                 "current_principal": None,
+                "role": "—",
                 "roles": [],
                 "roles_error": None,
+                "user_roles": [],
+                "user_roles_error": None,
                 "permissions": {"actions": [], "error": None},
                 "checks": [],
                 "required_access": [],
                 "hint": "Running in demo mode — no cloud API calls are made.",
             }
     except Exception as exc:  # noqa: BLE001
-        return jsonify(error=_cloud_error(exc)), 502
+        return _error_response(exc)
     return jsonify(data)
 
 
 @app.get("/health")
 def health():
-    return jsonify(
-        status="ok",
-        demo_mode=DEMO_MODE,
-        aws_cli=_aws_cli_path() is not None,
-        azure_cli=_az_cli_path() is not None,
+    """Liveness probe: cheap and dependency-free so it never restarts a healthy app."""
+    return jsonify(status="ok")
+
+
+@app.get("/ready")
+def ready():
+    """Readiness probe: the database must be reachable to serve traffic. Missing
+    cloud CLIs are reported but do not make the app unready (demo mode is valid)."""
+    db_ok = store.ping()
+    return (
+        jsonify(
+            status="ok" if db_ok else "error",
+            db=db_ok,
+            demo_mode=DEMO_MODE,
+            aws_cli=_aws_cli_path() is not None,
+            azure_cli=_az_cli_path() is not None,
+        ),
+        200 if db_ok else 503,
     )
 
 
@@ -1729,4 +2324,4 @@ def _cloud_error(exc: Exception) -> str:
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=FLASK_DEBUG)
